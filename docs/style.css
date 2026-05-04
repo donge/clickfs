@@ -65,10 +65,14 @@ h1 {
   display: flex;
   gap: 8px;
   align-items: stretch;
-  margin-bottom: 32px;
-  max-width: 520px;
+  margin-bottom: 12px;
+  max-width: 640px;
 }
-.install pre { flex: 1; margin: 0; }
+.install pre { flex: 1; margin: 0; min-width: 0; }
+.install pre code { white-space: nowrap; overflow-x: auto; display: block; }
+.install-group { margin-bottom: 32px; }
+.install-group .install:last-child { margin-bottom: 0; }
+.install-alt pre code { color: var(--dim); }
 
 .copy {
   background: var(--term);

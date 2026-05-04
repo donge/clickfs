@@ -46,6 +46,7 @@ pub struct ClickFs {
     db_cache: Arc<TtlCache<(), Vec<String>>>,
     table_cache: Arc<TtlCache<String, Vec<String>>>,
     part_cache: Arc<TtlCache<(String, String), Vec<String>>>,
+    #[allow(clippy::type_complexity)]
     exists_cache: Arc<TtlCache<(String, Option<String>, Option<String>), bool>>,
 }
 

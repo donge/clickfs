@@ -55,24 +55,42 @@ Both `all.tsv` and per-partition files are streamed lazily on `read()`.
 
 ## Install
 
-Requires Rust 1.85+, and either `libfuse3-dev` (Linux) or
-[macFUSE](https://osxfuse.github.io/) (macOS).
+### One-liner (Linux & macOS)
+
+```sh
+curl -fsSL https://donge.github.io/clickfs/install.sh | sh
+```
+
+Downloads the latest prebuilt binary to `~/.local/bin/clickfs`. For a
+system-wide install:
+
+```sh
+curl -fsSL https://donge.github.io/clickfs/install.sh | sudo sh -s -- --prefix /usr/local
+```
+
+Linux needs a `fuse3` package (`sudo apt install fuse3` or
+`sudo yum install fuse3`); macOS needs
+[macFUSE](https://osxfuse.github.io/) (`brew install --cask macfuse`).
+
+### From crates.io
 
 ```sh
 cargo install clickfs
 ```
 
-Or from source:
+Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) for
+prebuilt binaries (no compile):
+
+```sh
+cargo binstall clickfs
+```
+
+### From source
 
 ```sh
 cargo install --path .
-```
-
-Or build locally:
-
-```sh
-cargo build --release
-./target/release/clickfs --help
+# or
+cargo build --release && ./target/release/clickfs --help
 ```
 
 ---

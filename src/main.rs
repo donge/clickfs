@@ -66,9 +66,10 @@ mod cli {
             #[arg(long, default_value_t = false)]
             allow_other: bool,
 
-            /// Auto-unmount when the process exits.
-            #[arg(long, default_value_t = true)]
-            auto_unmount: bool,
+            /// Don't auto-unmount when the process exits (mount survives
+            /// process death; unmount manually with `clickfs umount`).
+            #[arg(long, default_value_t = false)]
+            no_auto_unmount: bool,
 
             /// Disable TLS certificate verification (dev/lab only).
             /// Mutually exclusive with --ca-bundle.
@@ -112,7 +113,7 @@ mod cli {
                 query_timeout,
                 max_result_bytes,
                 allow_other,
-                auto_unmount,
+                no_auto_unmount,
                 insecure,
                 ca_bundle,
                 cache_ttl_ms,
@@ -124,7 +125,7 @@ mod cli {
                 query_timeout,
                 max_result_bytes,
                 allow_other,
-                auto_unmount,
+                no_auto_unmount,
                 insecure,
                 ca_bundle,
                 cache_ttl_ms,
@@ -142,7 +143,7 @@ mod cli {
         query_timeout: u64,
         max_result_bytes: u64,
         allow_other: bool,
-        auto_unmount: bool,
+        no_auto_unmount: bool,
         insecure: bool,
         ca_bundle: Option<PathBuf>,
         cache_ttl_ms: u64,
@@ -226,13 +227,13 @@ mod cli {
             options.push(MountOption::DefaultPermissions);
             options.push(MountOption::NoSuid);
             options.push(MountOption::NoDev);
-            if auto_unmount {
+            if !no_auto_unmount {
                 options.push(MountOption::AutoUnmount);
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = auto_unmount; // silence unused-variable warning on macOS
+            let _ = no_auto_unmount; // silence unused-variable warning on macOS
         }
         if allow_other {
             options.push(MountOption::AllowOther);

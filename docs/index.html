@@ -27,9 +27,15 @@
     <h1>Mount ClickHouse as a filesystem.</h1>
     <p class="subtitle">Browse databases with <code>ls</code>. Stream tables with <code>cat</code>. No SQL boilerplate, no temp files.</p>
 
-    <div class="install">
-      <pre><code id="install-cmd" class="shell">cargo install clickfs</code></pre>
-      <button class="copy" data-target="install-cmd" aria-label="Copy install command">copy</button>
+    <div class="install-group">
+      <div class="install">
+        <pre><code id="install-cmd" class="shell">curl -fsSL https://donge.github.io/clickfs/install.sh | sh</code></pre>
+        <button class="copy" data-target="install-cmd" aria-label="Copy install command">copy</button>
+      </div>
+      <div class="install install-alt">
+        <pre><code id="install-cmd-cargo" class="shell">cargo install clickfs</code></pre>
+        <button class="copy" data-target="install-cmd-cargo" aria-label="Copy install command">copy</button>
+      </div>
     </div>
 
     <nav class="links">
@@ -44,7 +50,8 @@
     <ol class="steps">
       <li>
         <span class="step-label">Install</span>
-        <pre><code class="shell">cargo install clickfs</code></pre>
+        <pre><code class="shell">curl -fsSL https://donge.github.io/clickfs/install.sh | sh
+# or: cargo install clickfs</code></pre>
       </li>
       <li>
         <span class="step-label">Mount</span>

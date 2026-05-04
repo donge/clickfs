@@ -1,0 +1,136 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: linux-x86_64
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            name: linux-aarch64
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+            cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Install macFUSE (macos)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install --cask macfuse
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Strip binary
+        shell: bash
+        run: strip target/${{ matrix.target }}/release/clickfs || true
+
+      - name: Package tarball + checksum
+        id: pkg
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          ASSET="clickfs-${TAG}-${{ matrix.name }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "$ASSET" clickfs
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          else
+            sha256sum "$ASSET" > "$ASSET.sha256"
+          fi
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -la "$ASSET" "$ASSET.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          gh release create "$TAG" artifacts/* \
+            --repo "${{ github.repository }}" \
+            --title "clickfs $TAG" \
+            --notes "## Install
+
+\`\`\`sh
+curl -fsSL https://donge.github.io/clickfs/install.sh | sh
+\`\`\`
+
+Or with cargo:
+
+\`\`\`sh
+cargo install clickfs
+# or, prebuilt:
+cargo binstall clickfs
+\`\`\`
+
+## Assets
+
+Each platform has a \`.tar.gz\` containing the \`clickfs\` binary, plus a \`.sha256\` checksum file.
+
+| platform | asset |
+|---|---|
+| Linux x86_64  | clickfs-${TAG}-linux-x86_64.tar.gz  |
+| Linux aarch64 | clickfs-${TAG}-linux-aarch64.tar.gz |
+| macOS x86_64  | clickfs-${TAG}-macos-x86_64.tar.gz  |
+| macOS arm64   | clickfs-${TAG}-macos-arm64.tar.gz   |
+"
