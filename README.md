@@ -154,13 +154,29 @@ Or use the platform tool: `fusermount -u /mnt/ch` / `umount /mnt/ch`.
 
 ---
 
-## Reads are strict-sequential
+## Reads are strict-sequential (with a tail-mode escape hatch)
 
 Each open file handle is one streaming `SELECT`. The kernel must read
 contiguously from offset 0 forward — random seeks return `EIO`. This works
 fine for `cat`, `head`, `tail -c +N` (after stream reposition), `wc`, `grep`,
-and any pipeline. It will **not** work for `mmap`, random-access editors, or
-tools that seek backwards.
+and any pipeline. It will **not** work for `mmap` or random-access editors.
+
+For the common "show me the latest N rows" use case, `all.tsv` advertises
+a virtual EOF at `2^63` and supports **tail-mode**: when a reader pread()s
+deep inside that pseudo-EOF window (as `tail -n N`, `less +G`, and many
+log viewers do), clickfs transparently issues a one-shot
+`SELECT * FROM <tbl> ORDER BY <pk> DESC LIMIT N FORMAT TabSeparatedWithNames`
+and serves the (row-reversed) result from an in-memory buffer pinned to
+the end of the file. The header line is preserved.
+
+* Default: enabled, `N = 10000`. Tune with `--tail-rows N` /
+  `CLICKFS_TAIL_ROWS`, or disable with `--no-tail`.
+* The ORDER BY column list comes from `system.tables.primary_key`,
+  falling back to `sorting_key`, then `tuple()` for engines without a
+  key (Memory/Log/StripeLog).
+* Multi-column keys correctly apply `DESC` per column.
+* The buffer is per-fd; reads strictly *outside* the materialized
+  window still return `EIO` with a debug-level reverse-seek hint.
 
 `FOPEN_DIRECT_IO` is set on data files so the kernel page cache does not
 attempt readahead beyond the current position.
@@ -206,21 +222,23 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design, plus:
 - HTTP/HTTPS protocol only (no native TCP)
 - Read-only
 - TSV output only (TSVWithNames for `all.tsv`)
-- Strict-sequential reads per fd; reverse seeks fail with EIO and a
-  one-shot warning suggesting `cat | tail -n N` or `head -c N | tail`
+- Strict-sequential reads per fd; backwards seeks return EIO unless
+  they land inside the **tail-mode** materialization window (see
+  "Reads are strict-sequential" above)
 - Metadata listings (db/table/partition/existence) are cached for
   `--cache-ttl-ms` (default 2000 ms); `.schema` and data streams are
   always fresh
-- No KILL QUERY on cancel — relies on dropped HTTP connection +
-  `max_execution_time`
+- Stream cancellation issues `KILL QUERY` to the server in addition to
+  dropping the HTTP connection; queries also bound by
+  `max_execution_time=60`
 - Single ClickHouse server; no cluster / replica routing
 
 ---
 
 ## Tests
 
-- Unit tests: `cargo test --bin clickfs` (33 cases, no FUSE needed)
-- End-to-end: [`tests/e2e.sh`](tests/e2e.sh) — 31 cases against a real
+- Unit tests: `cargo test --bin clickfs` (56 cases, no FUSE needed)
+- End-to-end: [`tests/e2e.sh`](tests/e2e.sh) — 48 cases against a real
   ClickHouse + mounted FUSE. See [`tests/README.md`](tests/README.md).
 
 ```sh
