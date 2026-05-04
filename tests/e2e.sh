@@ -397,6 +397,32 @@ expect_zero   "T34 mount-time prefetch warms db cache" \
                 exit 1
               "
 
+# T35: streaming reads get a clickfs- prefixed query_id, and closing
+# the file early triggers a server-side KILL QUERY. We can't observe
+# the KILL on the server cheaply from a shell, but we CAN verify the
+# client-side log line that the kill_query call was issued. Read 1
+# byte from a stream file (which forces the stream to start) then
+# release the fd by letting head exit; Drop fires KILL.
+expect_zero   "T35 stream gets clickfs-prefixed query_id" \
+              bash -c "
+                head -c 1 '$STREAM_FILE' >/dev/null
+                # Wait for the spawned kill task to log.
+                for i in 1 2 3 4 5 6 7 8; do
+                  grep -q 'clickfs-' '$CLICKFS_LOG' && exit 0
+                  sleep 0.25
+                done
+                exit 1
+              "
+expect_zero   "T35a early close triggers kill query (best-effort)" \
+              bash -c "
+                head -c 1 '$STREAM_FILE' >/dev/null
+                for i in 1 2 3 4 5 6 7 8; do
+                  grep -q 'kill query sent' '$CLICKFS_LOG' && exit 0
+                  sleep 0.25
+                done
+                exit 1
+              "
+
 # T27: --cache-ttl-ms flag exists and accepts 0.
 expect_zero   "T27 --cache-ttl-ms is recognized" \
               bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--cache-ttl-ms'"

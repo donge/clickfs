@@ -53,6 +53,7 @@ dashmap = "6"
 libc = "0.2"
 url = "2"
 once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # On macOS, fuser must link against macFUSE's libfuse; the pure-Rust ABI path
 # is Linux-only. Enable the default features (libfuse + libfuse3) here so

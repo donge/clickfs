@@ -20,6 +20,15 @@ pub struct StreamHandle {
     /// Whether we've already warned about a reverse seek on this handle.
     /// Used to keep the log from filling up if a tool retries repeatedly.
     reverse_warned: AtomicBool,
+    /// Caller-side query_id used for KILL QUERY in Drop. We keep the
+    /// driver too so we can fire the KILL from a detached spawn that
+    /// outlives `self` only by milliseconds.
+    query_id: String,
+    driver: HttpDriver,
+    /// Tokio handle used by Drop to spawn the detached KILL. We can't
+    /// call `Handle::current()` from Drop because the FUSE worker thread
+    /// is not inside a runtime context.
+    rt: tokio::runtime::Handle,
     _task: JoinHandle<()>,
 }
 
@@ -39,9 +48,18 @@ impl StreamHandle {
         let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, QueryError>>(8);
         let cancel = Arc::new(Notify::new());
         let cancel_task = cancel.clone();
+        // Tag every streaming query so we can KILL it on early close.
+        // Prefix is ours so an operator inspecting system.processes can
+        // tell at a glance "this came from clickfs".
+        let query_id = format!("clickfs-{}", uuid::Uuid::new_v4());
+        let driver_for_task = driver.clone();
+        let qid_for_task = query_id.clone();
 
         let task = rt.spawn(async move {
-            let stream = match driver.query_stream(&sql).await {
+            let stream = match driver_for_task
+                .query_stream_with_id(&sql, Some(&qid_for_task))
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
@@ -52,7 +70,7 @@ impl StreamHandle {
             loop {
                 tokio::select! {
                     _ = cancel_task.notified() => {
-                        tracing::debug!(target: "clickfs::stream", "cancelled");
+                        tracing::debug!(target: "clickfs::stream", query_id = %qid_for_task, "cancelled");
                         break;
                     }
                     chunk = stream.next() => {
@@ -84,6 +102,9 @@ impl StreamHandle {
             })),
             cancel,
             reverse_warned: AtomicBool::new(false),
+            query_id,
+            driver,
+            rt: rt.clone(),
             _task: task,
         }
     }
@@ -160,12 +181,30 @@ impl StreamHandle {
     pub fn cancel(&self) {
         self.cancel.notify_waiters();
     }
+
+    /// The server-side query_id assigned to this stream. Exposed mainly
+    /// for tests and for operators wanting to correlate with
+    /// system.query_log.
+    #[allow(dead_code)]
+    pub fn query_id(&self) -> &str {
+        &self.query_id
+    }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
         self.cancel();
-        // Task is detached; it will observe cancellation on next await.
+        // Best-effort server-side cancellation. Connection drop alone is
+        // usually enough on a healthy server (ClickHouse notices the
+        // socket close and aborts), but the abort can lag by seconds on
+        // long-running queries — KILL QUERY ASYNC makes it deterministic.
+        // Detached: we don't await; the task lives in the runtime and
+        // will outlive `self` long enough to fire.
+        let driver = self.driver.clone();
+        let qid = self.query_id.clone();
+        self.rt.spawn(async move {
+            driver.kill_query(&qid).await;
+        });
     }
 }
 
@@ -242,5 +281,33 @@ mod tests {
         let c = h.read_blocking(rt.handle(), 8, 10).unwrap();
         assert_eq!(c, b"ij");
         assert!(!h.reverse_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn query_id_is_assigned_and_clickfs_prefixed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle(&rt, b"x");
+        let id = h.query_id();
+        assert!(
+            id.starts_with("clickfs-"),
+            "query_id should be clickfs-prefixed, got: {id}"
+        );
+        // UUID v4 is 36 chars; "clickfs-" prefix is 8 → 44 total.
+        assert_eq!(id.len(), 44, "expected clickfs- + uuidv4, got: {id}");
+    }
+
+    #[test]
+    fn distinct_handles_get_distinct_query_ids() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h1 = fake_handle(&rt, b"x");
+        let h2 = fake_handle(&rt, b"y");
+        assert_ne!(h1.query_id(), h2.query_id());
     }
 }

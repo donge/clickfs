@@ -210,23 +210,39 @@ impl HttpDriver {
 
     /// Streaming query. Returns a stream of Bytes chunks; dropping the stream
     /// closes the underlying HTTP connection (best-effort cancel).
+    #[allow(dead_code)]
     pub async fn query_stream(
         &self,
         sql: &str,
     ) -> std::result::Result<impl Stream<Item = std::result::Result<Bytes, QueryError>>, QueryError>
     {
-        let full_sql = self.append_settings(sql, true);
-        tracing::debug!(target: "clickfs::sql", kind = "stream", sql = %full_sql);
+        self.query_stream_with_id(sql, None).await
+    }
 
-        let resp = self
+    /// Streaming query with an optional caller-supplied query_id, used so
+    /// the caller can later issue `KILL QUERY WHERE query_id = ...` if the
+    /// reader goes away mid-stream. ClickHouse echoes the id back in
+    /// system.query_log and accepts it in KILL QUERY exactly as sent.
+    pub async fn query_stream_with_id(
+        &self,
+        sql: &str,
+        query_id: Option<&str>,
+    ) -> std::result::Result<impl Stream<Item = std::result::Result<Bytes, QueryError>>, QueryError>
+    {
+        let full_sql = self.append_settings(sql, true);
+        tracing::debug!(target: "clickfs::sql", kind = "stream", query_id = ?query_id, sql = %full_sql);
+
+        let mut req = self
             .client
             .post(self.base_url.clone())
             .basic_auth(&self.user, Some(&self.password))
             // Don't set request timeout here; rely on server max_execution_time.
-            .body(full_sql)
-            .send()
-            .await
-            .map_err(QueryError::from)?;
+            .body(full_sql);
+        if let Some(id) = query_id {
+            req = req.query(&[("query_id", id)]);
+        }
+
+        let resp = req.send().await.map_err(QueryError::from)?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -247,6 +263,39 @@ impl HttpDriver {
             .bytes_stream()
             .map(|r| r.map_err(|e| QueryError::Stream(e.to_string())));
         Ok(stream)
+    }
+
+    /// Best-effort `KILL QUERY ... ASYNC` for the given query_id. Used by
+    /// StreamHandle::Drop when a FUSE reader closes the file before EOF.
+    /// Errors are intentionally swallowed: the query may have already
+    /// finished, the user may not have KILL privilege, or the network
+    /// may be down — none of those should crash the FS.
+    pub async fn kill_query(&self, query_id: &str) {
+        let sql = format!(
+            "KILL QUERY WHERE query_id = {} ASYNC",
+            quote_string(query_id)
+        );
+        // Do NOT call append_settings here: KILL is a DDL-ish command and
+        // we don't want max_result_bytes/readonly=2 to interfere.
+        let res = self
+            .client
+            .post(self.base_url.clone())
+            .basic_auth(&self.user, Some(&self.password))
+            .timeout(Duration::from_secs(5))
+            .body(sql)
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!(target: "clickfs::stream", query_id, "kill query sent");
+            }
+            Ok(r) => {
+                tracing::debug!(target: "clickfs::stream", query_id, status = %r.status(), "kill query rejected");
+            }
+            Err(e) => {
+                tracing::debug!(target: "clickfs::stream", query_id, error = %e, "kill query transport failed");
+            }
+        }
     }
 
     /// Health check used by `mount` startup.
