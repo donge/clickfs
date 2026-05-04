@@ -383,6 +383,20 @@ expect_zero   "T33a default mount sends enable_http_compression=1" \
                 grep -q 'enable_http_compression=1' '$CLICKFS_LOG'
               "
 
+# T34: mount-time metadata prefetch warms db_cache so the very first
+# `ls /mnt/db` is a cache hit. Best-effort: we just check the prefetch
+# task ran and logged a "warmed db cache" line. The task is spawned
+# synchronously by ClickFs::new, but completes asynchronously, so we
+# poll the log up to a few seconds.
+expect_zero   "T34 mount-time prefetch warms db cache" \
+              bash -c "
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                  grep -q 'warmed db cache' '$CLICKFS_LOG' && exit 0
+                  sleep 0.5
+                done
+                exit 1
+              "
+
 # T27: --cache-ttl-ms flag exists and accepts 0.
 expect_zero   "T27 --cache-ttl-ms is recognized" \
               bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--cache-ttl-ms'"

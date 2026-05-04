@@ -58,7 +58,7 @@ impl ClickFs {
         } else {
             tracing::info!(target: "clickfs::cache", ttl_ms = cache_ttl_ms, "metadata cache enabled");
         }
-        Self {
+        let fs = Self {
             driver,
             rt,
             inodes: Arc::new(InodeTable::new()),
@@ -71,7 +71,72 @@ impl ClickFs {
             table_cache: Arc::new(TtlCache::new(ttl)),
             part_cache: Arc::new(TtlCache::new(ttl)),
             exists_cache: Arc::new(TtlCache::new(ttl)),
+        };
+        // Warm metadata caches in the background so the very first
+        // `ls /mnt/db` doesn't pay the round-trip cost. No-op when
+        // caching is disabled (TTL=0) since each insert would expire
+        // before the user can observe it.
+        if !ttl.is_zero() {
+            fs.spawn_prefetch();
         }
+        fs
+    }
+
+    /// Background warm-up of `db_cache` and the first level of
+    /// `table_cache`. Best-effort: any error is logged at debug and
+    /// ignored — the synchronous fetch path will retry on demand.
+    fn spawn_prefetch(&self) {
+        let driver = self.driver.clone();
+        let db_cache = self.db_cache.clone();
+        let table_cache = self.table_cache.clone();
+        self.rt.spawn(async move {
+            let body = match driver.query_text(&driver::sql_list_databases()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(target: "clickfs::prefetch", error = %e, "list databases failed");
+                    return;
+                }
+            };
+            let dbs: Vec<String> = body
+                .lines()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            tracing::info!(target: "clickfs::prefetch", count = dbs.len(), "warmed db cache");
+            db_cache.insert((), dbs.clone());
+
+            // Warm tables for each db concurrently. We bound parallelism
+            // to a sane number — even a few hundred dbs is rare, but
+            // we don't want to flood ClickHouse with hundreds of
+            // simultaneous SHOW TABLES queries on huge installs.
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut tasks = FuturesUnordered::new();
+            for db in dbs {
+                let driver = driver.clone();
+                tasks.push(async move {
+                    let sql = driver::sql_list_tables(&db);
+                    let body = driver.query_text(&sql).await.ok()?;
+                    let tbls: Vec<String> = body
+                        .lines()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    Some((db, tbls))
+                });
+                // Keep at most 8 in-flight.
+                if tasks.len() >= 8 {
+                    if let Some(Some((db, tbls))) = tasks.next().await {
+                        table_cache.insert(db, tbls);
+                    }
+                }
+            }
+            while let Some(item) = tasks.next().await {
+                if let Some((db, tbls)) = item {
+                    table_cache.insert(db, tbls);
+                }
+            }
+            tracing::info!(target: "clickfs::prefetch", "warmed table caches");
+        });
     }
 
     fn dir_attr(&self, ino: u64) -> FileAttr {
@@ -661,5 +726,53 @@ impl Filesystem for ClickFs {
             255,                                     // namelen
             BLOCK_SIZE,                              // frsize
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{CompressionConfig, HttpDriver, TlsConfig};
+    use url::Url;
+
+    fn unreachable_driver() -> HttpDriver {
+        // Port 1 is reserved & nothing listens — any prefetch query
+        // will fail fast with a connection refused, which is exactly
+        // the "best-effort, swallow errors" path we want to exercise.
+        HttpDriver::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            "u".into(),
+            "p".into(),
+            5,
+            1024,
+            TlsConfig::default(),
+            CompressionConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn new_with_ttl_zero_does_not_panic_and_skips_prefetch() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fs = ClickFs::new(unreachable_driver(), rt.handle().clone(), 0);
+        assert!(fs.db_cache.get(&()).is_none());
+    }
+
+    #[test]
+    fn new_with_ttl_nonzero_spawns_prefetch_and_survives_failure() {
+        // Prefetch fires against 127.0.0.1:1 and fails. Must not panic
+        // or block ClickFs::new.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let fs = ClickFs::new(unreachable_driver(), rt.handle().clone(), 2000);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Cache stays empty because the query errored out.
+        assert!(fs.db_cache.get(&()).is_none());
     }
 }
