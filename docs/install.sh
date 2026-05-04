@@ -118,7 +118,15 @@ detect_platform() {
 
   case "$arch_raw" in
     x86_64|amd64)
-      arch_id=x86_64;;
+      if [ "$os_id" = "macos" ]; then
+        # No native Intel macOS binary is published; use arm64 via Rosetta 2.
+        warn "Intel macOS detected; using arm64 binary via Rosetta 2."
+        warn "Make sure Rosetta is installed: softwareupdate --install-rosetta --agree-to-license"
+        arch_id=arm64
+      else
+        arch_id=x86_64
+      fi
+      ;;
     aarch64|arm64)
       if [ "$os_id" = "macos" ]; then
         arch_id=arm64
