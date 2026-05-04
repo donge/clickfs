@@ -1,8 +1,14 @@
 # clickfs
 
+[![crates.io](https://img.shields.io/crates/v/clickfs.svg)](https://crates.io/crates/clickfs)
+[![docs](https://img.shields.io/badge/docs-donge.github.io%2Fclickfs-FFCC01)](https://donge.github.io/clickfs)
+[![license](https://img.shields.io/crates/l/clickfs.svg)](#license)
+
 Mount a ClickHouse server as a read-only POSIX filesystem. Browse databases
 with `ls`, stream tables with `cat`, slice with `head`/`tail`/`grep` — no
 client library, no SQL boilerplate.
+
+**Website:** https://donge.github.io/clickfs
 
 > Status: **MVP / experimental**. Read-only. Single-node HTTP only.
 > Tested on Linux (libfuse3) and macOS (macFUSE).
@@ -50,6 +56,12 @@ Both `all.tsv` and per-partition files are streamed lazily on `read()`.
 
 Requires Rust 1.85+, and either `libfuse3-dev` (Linux) or
 [macFUSE](https://osxfuse.github.io/) (macOS).
+
+```sh
+cargo install clickfs
+```
+
+Or from source:
 
 ```sh
 cargo install --path .

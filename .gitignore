@@ -1,3 +1,5 @@
 /target
+/target-linux
+/.cache
 **/*.rs.bk
 .DS_Store

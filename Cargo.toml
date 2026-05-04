@@ -1,9 +1,17 @@
 [package]
 name = "clickfs"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-description = "Mount ClickHouse as a POSIX filesystem"
+description = "Mount ClickHouse as a read-only POSIX filesystem"
 license = "MIT OR Apache-2.0"
+authors = ["donge <donge@donge.org>"]
+repository = "https://github.com/donge/clickfs"
+homepage = "https://donge.github.io/clickfs"
+documentation = "https://donge.github.io/clickfs"
+readme = "README.md"
+keywords = ["clickhouse", "fuse", "filesystem", "cli", "database"]
+categories = ["command-line-utilities", "filesystem", "database"]
+exclude = ["docs/*", "tests/*", "TEST_REPORT.md", ".github/*"]
 
 [[bin]]
 name = "clickfs"
