@@ -3,7 +3,7 @@
 mod cache;
 mod driver;
 mod error;
-
+#[cfg(feature = "fuse")]
 mod fs;
 mod inode;
 mod readme;
