@@ -106,31 +106,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF##*/}"
+          cat > release-notes.md <<EOF
+          ## Install
+
+          \`\`\`sh
+          curl -fsSL https://donge.github.io/clickfs/install.sh | sh
+          \`\`\`
+
+          Or with cargo:
+
+          \`\`\`sh
+          cargo install clickfs
+          # or, prebuilt:
+          cargo binstall clickfs
+          \`\`\`
+
+          ## Assets
+
+          Each platform has a \`.tar.gz\` containing the \`clickfs\` binary, plus a \`.sha256\` checksum file.
+
+          | platform | asset |
+          |---|---|
+          | Linux x86_64  | clickfs-${TAG}-linux-x86_64.tar.gz  |
+          | Linux aarch64 | clickfs-${TAG}-linux-aarch64.tar.gz |
+          | macOS x86_64  | clickfs-${TAG}-macos-x86_64.tar.gz  |
+          | macOS arm64   | clickfs-${TAG}-macos-arm64.tar.gz   |
+          EOF
+          # strip the leading 10-space indentation introduced by YAML block scalar
+          sed -i 's/^          //' release-notes.md
           gh release create "$TAG" artifacts/* \
             --repo "${{ github.repository }}" \
             --title "clickfs $TAG" \
-            --notes "## Install
-
-\`\`\`sh
-curl -fsSL https://donge.github.io/clickfs/install.sh | sh
-\`\`\`
-
-Or with cargo:
-
-\`\`\`sh
-cargo install clickfs
-# or, prebuilt:
-cargo binstall clickfs
-\`\`\`
-
-## Assets
-
-Each platform has a \`.tar.gz\` containing the \`clickfs\` binary, plus a \`.sha256\` checksum file.
-
-| platform | asset |
-|---|---|
-| Linux x86_64  | clickfs-${TAG}-linux-x86_64.tar.gz  |
-| Linux aarch64 | clickfs-${TAG}-linux-aarch64.tar.gz |
-| macOS x86_64  | clickfs-${TAG}-macos-x86_64.tar.gz  |
-| macOS arm64   | clickfs-${TAG}-macos-arm64.tar.gz   |
-"
+            --notes-file release-notes.md
