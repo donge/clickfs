@@ -65,3 +65,5 @@ fuser = { version = "0.14", optional = true }
 [profile.release]
 opt-level = 3
 lto = "thin"
+strip = true
+codegen-units = 1
