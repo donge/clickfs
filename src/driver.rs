@@ -10,7 +10,36 @@ use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
 use url::Url;
 
-use crate::error::{QueryError, Result};
+use crate::error::{clickhouse_code_name, parse_clickhouse_error, QueryError, Result};
+
+/// Convert a non-success HTTP response into a `QueryError`, preferring a
+/// structured `QueryError::ClickHouse` when we can parse one out of the
+/// `X-ClickHouse-Exception-Code` header or the body.
+///
+/// Falls back to `QueryError::Auth` for 401/403 with no parseable code,
+/// and `QueryError::Server` for everything else.
+fn classify_error(status: u16, header_code: Option<&str>, body: String) -> QueryError {
+    if let Some((code, message)) = parse_clickhouse_error(header_code, &body) {
+        let name = clickhouse_code_name(code);
+        tracing::warn!(
+            target: "clickfs::ch",
+            code,
+            name,
+            status,
+            "clickhouse exception: {}",
+            message
+        );
+        return QueryError::ClickHouse {
+            code,
+            name,
+            message,
+        };
+    }
+    if status == 401 || status == 403 {
+        return QueryError::Auth;
+    }
+    QueryError::Server { status, body }
+}
 
 #[derive(Clone)]
 pub struct HttpDriver {
@@ -78,15 +107,18 @@ impl HttpDriver {
             .map_err(QueryError::from)?;
 
         let status = resp.status();
+        let header_code = resp
+            .headers()
+            .get("X-ClickHouse-Exception-Code")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let body = resp.text().await.map_err(QueryError::from)?;
         if !status.is_success() {
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(QueryError::Auth);
-            }
-            return Err(QueryError::Server {
-                status: status.as_u16(),
+            return Err(classify_error(
+                status.as_u16(),
+                header_code.as_deref(),
                 body,
-            });
+            ));
         }
         Ok(body)
     }
@@ -113,14 +145,17 @@ impl HttpDriver {
 
         let status = resp.status();
         if !status.is_success() {
+            let header_code = resp
+                .headers()
+                .get("X-ClickHouse-Exception-Code")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let body = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(QueryError::Auth);
-            }
-            return Err(QueryError::Server {
-                status: status.as_u16(),
+            return Err(classify_error(
+                status.as_u16(),
+                header_code.as_deref(),
                 body,
-            });
+            ));
         }
 
         let stream = resp
