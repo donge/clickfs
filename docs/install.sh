@@ -94,7 +94,8 @@ main() {
   fi
 
   TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t clickfs)"
-  trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP
+  trap 'rm -rf "$TMPDIR"' EXIT
+  trap 'rm -rf "$TMPDIR"; exit 130' INT TERM HUP
 
   download_and_verify
   install_binary
@@ -184,13 +185,17 @@ System Settings -> Privacy & Security, then re-run this installer."
 
 download_and_verify() {
   say "downloading $ASSET..."
-  if ! curl --proto '=https' --tlsv1.2 -fSL --progress-bar "$URL" -o "$TMPDIR/$ASSET"; then
+  if ! curl --proto '=https' --tlsv1.2 -fSL --progress-bar \
+         --connect-timeout 10 --retry 2 --retry-delay 2 \
+         "$URL" -o "$TMPDIR/$ASSET"; then
     die "failed to download $URL
   - check your internet connection
   - confirm the release exists: https://github.com/${REPO}/releases"
   fi
 
-  if curl --proto '=https' --tlsv1.2 -fsSL "$SHA_URL" -o "$TMPDIR/$ASSET.sha256" 2>/dev/null; then
+  if curl --proto '=https' --tlsv1.2 -fsSL \
+        --connect-timeout 5 --max-time 15 --retry 2 --retry-delay 1 \
+        "$SHA_URL" -o "$TMPDIR/$ASSET.sha256" 2>/dev/null; then
     if command -v shasum >/dev/null 2>&1; then
       sumtool="shasum -a 256"
     elif command -v sha256sum >/dev/null 2>&1; then
