@@ -76,25 +76,11 @@ struct Inner {
 }
 
 impl StreamHandle {
-    /// Spawn a streaming task without tail-mode fallback. Existing
-    /// callers (HeadNdjson, StreamPartition) use this — they don't need
-    /// `tail`-style reverse synthesis.
-    pub fn spawn(rt: &tokio::runtime::Handle, driver: HttpDriver, sql: String) -> Self {
-        Self::spawn_inner(rt, driver, sql, None)
-    }
-
-    /// Same as `spawn` but also remembers a `TailContext` so a large
-    /// reverse pread can synthesize a tail buffer on demand.
-    pub fn spawn_with_tail(
-        rt: &tokio::runtime::Handle,
-        driver: HttpDriver,
-        sql: String,
-        tail: TailContext,
-    ) -> Self {
-        Self::spawn_inner(rt, driver, sql, Some(tail))
-    }
-
-    fn spawn_inner(
+    /// Spawn a streaming task. When `tail` is `Some`, a large reverse
+    /// pread can synthesize a tail buffer on demand
+    /// (`SELECT ... ORDER BY <pk> DESC LIMIT N`). When `None`, reverse
+    /// preads beyond the current cursor are rejected with EIO.
+    pub fn spawn(
         rt: &tokio::runtime::Handle,
         driver: HttpDriver,
         sql: String,
@@ -407,7 +393,7 @@ mod tests {
             crate::driver::CompressionConfig::default(),
         )
         .unwrap();
-        let h = StreamHandle::spawn(rt.handle(), driver, "SELECT 1".into());
+        let h = StreamHandle::spawn(rt.handle(), driver, "SELECT 1".into(), None);
         // Replace the channel state synchronously: stuff `body` into pending
         // and mark upstream done so reads don't block on rx.
         rt.block_on(async {

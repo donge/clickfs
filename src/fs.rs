@@ -517,7 +517,7 @@ impl Filesystem for ClickFs {
                 // 100 rows is plenty for `cat | jq` reconnaissance and
                 // small enough that we don't need streaming back-pressure.
                 let sql = driver::sql_head_ndjson(db, tbl, 100);
-                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
+                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
                 FileHandle::Stream(Arc::new(s))
             }
             PlanKind::StreamAll => {
@@ -534,10 +534,10 @@ impl Filesystem for ClickFs {
                         order_expr,
                         cfg: self.tail_cfg.clone(),
                     };
-                    let s = StreamHandle::spawn_with_tail(&self.rt, self.driver.clone(), sql, tail);
+                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, Some(tail));
                     FileHandle::Stream(Arc::new(s))
                 } else {
-                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
+                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
                     FileHandle::Stream(Arc::new(s))
                 }
             }
@@ -545,7 +545,7 @@ impl Filesystem for ClickFs {
                 let db = plan.db.as_deref().unwrap();
                 let tbl = plan.table.as_deref().unwrap();
                 let sql = driver::sql_stream_partition(db, tbl, part);
-                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
+                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
                 FileHandle::Stream(Arc::new(s))
             }
             _ => {
