@@ -11,6 +11,8 @@ client library, no SQL boilerplate.
 
 **Website:** https://donge.github.io/clickfs
 
+<img width="1536" height="1024" alt="0a3556a64c0ead49ef732950ebfd0776" src="https://github.com/user-attachments/assets/e6757055-bcd7-445d-b829-3794ed6c89f4" />
+
 > Status: **MVP / experimental**. Read-only. Single-node HTTP only.
 > Tested on Linux (libfuse3) and macOS (macFUSE).
 
