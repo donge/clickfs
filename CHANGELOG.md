@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-04
+
+### Removed
+
+- **`head.ndjson` per-table pseudo-file.** The dedicated 100-row
+  JSONEachRow preview duplicated functionality already available
+  through `all.tsv`. To get a quick TSV preview, use
+  `cat <mountpoint>/db/<db>/<tbl>/all.tsv | head -n 100`. If you
+  specifically need NDJSON for `jq` workflows, run
+  `clickhouse-client --query 'SELECT * FROM <db>.<tbl> LIMIT 100
+  FORMAT JSONEachRow'`. Removing the route shrinks the per-table
+  surface, drops a `PlanKind` variant, an `open()` arm, the
+  `sql_head_ndjson` helper, and ~30 lines of docs/tests.
+
+### Changed
+
+- **Slimmer release artifacts.** `Cargo.toml` `[profile.release]`
+  now sets `strip = true` and `codegen-units = 1`. Binary size on
+  macOS arm64 shrinks from 5.9 MB to 4.0 MB (-32%), with similar
+  reductions across the Linux targets. CI release builds get ~2×
+  slower, which is acceptable for a tagged-release pipeline.
+  `panic = "abort"` is intentionally NOT enabled: a FUSE driver
+  benefits from backtraces inside worker threads.
+
+### Internal
+
+- Collapsed eight identical EROFS read-only stubs in
+  `fuser::Filesystem` impl into one `erofs_stub!` macro.
+- Removed the unused `query_stream` wrapper in `driver.rs`; all
+  callers go through `query_stream_with_id` to enable
+  `KILL QUERY` on early close.
+- Merged `StreamHandle::spawn` and `spawn_with_tail` into a single
+  `spawn(.., tail: Option<TailContext>)` API.
+
 ## [0.3.1] - 2026-05-04
 
 ### Changed
