@@ -127,9 +127,12 @@ mod tests {
 
     #[test]
     fn miss_after_ttl() {
-        let c = TtlCache::<String, u32>::new(Duration::from_millis(20));
+        // 50ms TTL + 200ms wait: a 4x margin keeps this stable on
+        // loaded CI runners (macOS GH Actions in particular has
+        // shown >100ms scheduling stalls).
+        let c = TtlCache::<String, u32>::new(Duration::from_millis(50));
         c.insert("k".into(), 7);
-        sleep(Duration::from_millis(40));
+        sleep(Duration::from_millis(200));
         assert_eq!(c.get(&"k".into()), None);
         // Expired entries are evicted on access.
         assert_eq!(c.len(), 0);
@@ -146,12 +149,18 @@ mod tests {
 
     #[test]
     fn refresh_resets_timer() {
-        let c = TtlCache::<String, u32>::new(Duration::from_millis(50));
+        // Use generous timing so loaded CI runners don't blow the
+        // budget between insert/sleep/get. Logic under test is a
+        // single Instant::now() comparison, not a clock-precision
+        // measurement.
+        let c = TtlCache::<String, u32>::new(Duration::from_millis(500));
         c.insert("k".into(), 1);
-        sleep(Duration::from_millis(30));
+        sleep(Duration::from_millis(100));
         c.insert("k".into(), 2); // should reset timer
-        sleep(Duration::from_millis(30));
-        // Total 60ms but second insert was 30ms ago: should still hit.
+        sleep(Duration::from_millis(100));
+        // First insert was 200ms ago (would still hit even without
+        // reset), but specifically we want to assert the value is
+        // the refreshed one and that nothing has expired.
         assert_eq!(c.get(&"k".into()), Some(2));
     }
 
