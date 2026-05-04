@@ -1,6 +1,10 @@
 //! Streaming bridge between async ClickHouse stream and sync FUSE read().
 //!
-//! Strict-sequential semantics: read(offset) where offset != stream_pos → EIO.
+//! Strict-sequential semantics: read(offset) where offset != stream_pos → EIO,
+//! UNLESS tail-buffer materialization kicks in (large reverse pread, e.g.
+//! `tail -n N`). In that case we issue a one-shot
+//! `SELECT * ORDER BY <pk> DESC LIMIT N` and pin the (row-reversed)
+//! result to the file's pseudo-EOF so subsequent reads land in-buffer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,8 +14,26 @@ use futures::stream::StreamExt;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::driver::HttpDriver;
+use crate::driver::{HttpDriver, TailConfig};
 use crate::error::{ClickFsError, QueryError};
+
+/// The pseudo-size we report for stream files. `tail` will lseek to this
+/// then start pread-ing backwards from here.
+pub const PSEUDO_EOF: u64 = u64::MAX / 2;
+
+/// Reverse-pread distance that flips us into "this is tail" mode.
+const TAIL_TRIGGER_GAP: u64 = 32 * 1024 * 1024;
+
+/// Per-table info needed to materialize a tail buffer on demand.
+#[derive(Clone)]
+pub struct TailContext {
+    pub db: String,
+    pub tbl: String,
+    /// Comma-separated column list, or the literal `tuple()` for tables
+    /// without a primary/sorting key.
+    pub order_expr: String,
+    pub cfg: TailConfig,
+}
 
 /// State of a single streaming file handle.
 pub struct StreamHandle {
@@ -29,6 +51,9 @@ pub struct StreamHandle {
     /// call `Handle::current()` from Drop because the FUSE worker thread
     /// is not inside a runtime context.
     rt: tokio::runtime::Handle,
+    /// Tail-buffer materialization context. None = strict-sequential
+    /// only (no reverse-pread fallback).
+    tail: Option<TailContext>,
     _task: JoinHandle<()>,
 }
 
@@ -40,11 +65,41 @@ struct Inner {
     pos: u64,
     upstream_done: bool,
     last_err: Option<QueryError>,
+    /// Once a reverse pread triggers materialization we buffer the
+    /// (row-reversed) tail here and serve subsequent reads from it.
+    /// The buffer is conceptually pinned to `[PSEUDO_EOF - len, PSEUDO_EOF)`.
+    tail_buf: Option<Bytes>,
+    /// Set true once we've attempted (success or failure) to materialize
+    /// the tail buffer. Prevents re-issuing the SQL on every reverse
+    /// pread when the table is e.g. unreachable.
+    tail_attempted: bool,
 }
 
 impl StreamHandle {
-    /// Spawn a streaming task. Caller passes the runtime handle so we can spawn.
+    /// Spawn a streaming task without tail-mode fallback. Existing
+    /// callers (HeadNdjson, StreamPartition) use this — they don't need
+    /// `tail`-style reverse synthesis.
     pub fn spawn(rt: &tokio::runtime::Handle, driver: HttpDriver, sql: String) -> Self {
+        Self::spawn_inner(rt, driver, sql, None)
+    }
+
+    /// Same as `spawn` but also remembers a `TailContext` so a large
+    /// reverse pread can synthesize a tail buffer on demand.
+    pub fn spawn_with_tail(
+        rt: &tokio::runtime::Handle,
+        driver: HttpDriver,
+        sql: String,
+        tail: TailContext,
+    ) -> Self {
+        Self::spawn_inner(rt, driver, sql, Some(tail))
+    }
+
+    fn spawn_inner(
+        rt: &tokio::runtime::Handle,
+        driver: HttpDriver,
+        sql: String,
+        tail: Option<TailContext>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, QueryError>>(8);
         let cancel = Arc::new(Notify::new());
         let cancel_task = cancel.clone();
@@ -99,41 +154,114 @@ impl StreamHandle {
                 pos: 0,
                 upstream_done: false,
                 last_err: None,
+                tail_buf: None,
+                tail_attempted: false,
             })),
             cancel,
             reverse_warned: AtomicBool::new(false),
             query_id,
             driver,
             rt: rt.clone(),
+            tail,
             _task: task,
         }
     }
 
     /// Synchronous read used from the FUSE worker thread.
     ///
-    /// Strict-sequential: `offset` MUST equal the current stream position.
+    /// Strict-sequential by default: `offset` MUST equal the current
+    /// stream position. A large reverse pread (offset > pos +
+    /// `TAIL_TRIGGER_GAP`) when a `TailContext` is set triggers a
+    /// one-shot materialization of `SELECT * ORDER BY <pk> DESC LIMIT N`
+    /// and serves subsequent reads from that buffer.
     pub fn read_blocking(
         &self,
         rt: &tokio::runtime::Handle,
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>, ClickFsError> {
+        // Fast path: serve from an already-materialized tail buffer
+        // whenever the offset falls inside it. Held under the lock to
+        // keep tail_buf access consistent.
         let inner = self.inner.clone();
+
+        // Step 1: maybe materialize the tail buffer. Done outside the
+        // lock so the (potentially slow) HTTP call doesn't block other
+        // reads. The flag `tail_attempted` (set under the lock) prevents
+        // re-entry.
+        let need_materialize = {
+            let g = rt.block_on(async { inner.lock().await });
+            offset != g.pos
+                && !g.tail_attempted
+                && g.tail_buf.is_none()
+                && self.tail.is_some()
+                && offset > g.pos.saturating_add(TAIL_TRIGGER_GAP)
+        };
+        if need_materialize {
+            let tail = self.tail.as_ref().unwrap().clone();
+            let driver = self.driver.clone();
+            let mat = rt.block_on(async move { materialize_tail(&driver, &tail).await });
+            let mut g = rt.block_on(async { inner.lock().await });
+            g.tail_attempted = true;
+            match mat {
+                Ok(buf) => {
+                    tracing::info!(
+                        target: "clickfs::stream",
+                        query_id = %self.query_id,
+                        bytes = buf.len(),
+                        "tail buffer materialized"
+                    );
+                    g.tail_buf = Some(buf);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "clickfs::stream",
+                        query_id = %self.query_id,
+                        error = %e,
+                        "tail buffer materialization failed; falling back to EIO"
+                    );
+                }
+            }
+        }
+
         rt.block_on(async move {
             let mut g = inner.lock().await;
 
-            // Check for prior fatal error.
-            if let Some(e) = g.last_err.take() {
-                return Err(ClickFsError::Query(e));
+            // Check for prior fatal error on the forward stream (only
+            // surfaces while we're still serving forward).
+            if offset == g.pos {
+                if let Some(e) = g.last_err.take() {
+                    return Err(ClickFsError::Query(e));
+                }
+            }
+
+            // Tail buffer hit: serve any read whose offset lands inside
+            // the buffer's pinned range.
+            if let Some(buf) = &g.tail_buf {
+                let buf_origin = PSEUDO_EOF.saturating_sub(buf.len() as u64);
+                if offset >= buf_origin && offset < PSEUDO_EOF {
+                    let local = (offset - buf_origin) as usize;
+                    if local >= buf.len() {
+                        return Ok(Vec::new());
+                    }
+                    let take = std::cmp::min(size, buf.len() - local);
+                    return Ok(buf[local..local + take].to_vec());
+                }
+                // Inside virtual EOF but past buffer end → EOF.
+                if offset >= PSEUDO_EOF {
+                    return Ok(Vec::new());
+                }
+                // Falls through: a forward read that came BEFORE the
+                // tail trigger. We still serve it from the live stream.
             }
 
             if offset != g.pos {
-                // A backwards (or skipping) seek breaks streaming semantics.
-                // Warn once per handle so the log isn't flooded by tools that
-                // retry. Common offenders: `tail -n N` (seeks to EOF first),
-                // editors with mmap, anything calling lseek(SEEK_END).
+                // A backwards (or skipping) seek breaks streaming
+                // semantics. Demoted to debug now that tail-mode is the
+                // documented escape hatch — common offenders (`tail`,
+                // `less G`) are handled above.
                 if offset < g.pos && !self.reverse_warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "clickfs::stream",
                         cursor = g.pos,
                         requested_offset = offset,
@@ -189,6 +317,55 @@ impl StreamHandle {
     pub fn query_id(&self) -> &str {
         &self.query_id
     }
+}
+
+/// One-shot fetch of `SELECT * ORDER BY <pk> DESC LIMIT N` followed by
+/// an in-memory row-reversal so the buffer reads "oldest first". The
+/// header line is preserved at offset 0.
+async fn materialize_tail(driver: &HttpDriver, tail: &TailContext) -> Result<Bytes, QueryError> {
+    let sql = crate::driver::sql_select_tail(&tail.db, &tail.tbl, &tail.order_expr, tail.cfg.rows);
+    let body = driver.query_text(&sql).await?;
+    Ok(reverse_tsv_rows(&body))
+}
+
+/// Reverse the data lines of a TabSeparatedWithNames body. Header line
+/// (first \n-delimited line) stays in place; trailing empty line, if
+/// present, is preserved as-is. Result has exactly one trailing
+/// newline if the input did.
+fn reverse_tsv_rows(body: &str) -> Bytes {
+    if body.is_empty() {
+        return Bytes::new();
+    }
+    let mut lines: Vec<&str> = body.split('\n').collect();
+    // split('\n') on "a\nb\n" yields ["a","b",""]; preserve that empty
+    // tail as the terminating newline.
+    let trailing_empty = matches!(lines.last(), Some(&""));
+    if trailing_empty {
+        lines.pop();
+    }
+    if lines.len() <= 1 {
+        // Just a header (or nothing): nothing to reverse.
+        let mut out = lines.join("\n");
+        if trailing_empty {
+            out.push('\n');
+        }
+        return Bytes::from(out);
+    }
+    let header = lines.remove(0);
+    lines.reverse();
+    let mut out = String::with_capacity(body.len());
+    out.push_str(header);
+    out.push('\n');
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if trailing_empty {
+        out.push('\n');
+    }
+    Bytes::from(out)
 }
 
 impl Drop for StreamHandle {
@@ -309,5 +486,76 @@ mod tests {
         let h1 = fake_handle(&rt, b"x");
         let h2 = fake_handle(&rt, b"y");
         assert_ne!(h1.query_id(), h2.query_id());
+    }
+
+    #[test]
+    fn reverse_tsv_rows_keeps_header_reverses_data() {
+        let body = "name\tage\nalice\t30\nbob\t40\ncarol\t50\n";
+        let out = reverse_tsv_rows(body);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert_eq!(s, "name\tage\ncarol\t50\nbob\t40\nalice\t30\n");
+    }
+
+    #[test]
+    fn reverse_tsv_rows_handles_empty_and_header_only() {
+        assert_eq!(&reverse_tsv_rows("")[..], b"");
+        // header only, with trailing newline
+        assert_eq!(&reverse_tsv_rows("a\tb\n")[..], b"a\tb\n");
+        // header only, no trailing newline
+        assert_eq!(&reverse_tsv_rows("a\tb")[..], b"a\tb");
+    }
+
+    #[test]
+    fn reverse_tsv_rows_no_trailing_newline() {
+        let body = "h\nx\ny\nz";
+        let out = reverse_tsv_rows(body);
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "h\nz\ny\nx");
+    }
+
+    #[test]
+    fn tail_buffer_serves_reverse_pread_inside_buffer() {
+        // Hand-craft a StreamHandle, then directly install a tail_buf
+        // (simulating a successful materialize_tail) and verify reads
+        // pinned to PSEUDO_EOF land in-buffer.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle(&rt, b"");
+        let tail_bytes = Bytes::from_static(b"name\tage\nalice\t30\nbob\t40\n");
+        let tail_len = tail_bytes.len() as u64;
+        rt.block_on(async {
+            let mut g = h.inner.lock().await;
+            g.tail_buf = Some(tail_bytes);
+            g.tail_attempted = true;
+        });
+        let buf_origin = PSEUDO_EOF - tail_len;
+        // Read whole buffer.
+        let buf = h
+            .read_blocking(rt.handle(), buf_origin, tail_len as usize)
+            .unwrap();
+        assert_eq!(buf, b"name\tage\nalice\t30\nbob\t40\n");
+        // Read past EOF -> empty.
+        let buf2 = h.read_blocking(rt.handle(), PSEUDO_EOF, 10).unwrap();
+        assert!(buf2.is_empty());
+        // Read partial from middle of buffer.
+        let buf3 = h.read_blocking(rt.handle(), buf_origin + 9, 10).unwrap();
+        assert_eq!(buf3, b"alice\t30\nb");
+    }
+
+    #[test]
+    fn tail_disabled_keeps_reverse_seek_eio() {
+        // No TailContext => reverse pread still EIO even if huge.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle(&rt, b"abc");
+        let _ = h.read_blocking(rt.handle(), 0, 3).unwrap();
+        // Now pos=3; reverse pread to a huge offset.
+        let err = h
+            .read_blocking(rt.handle(), PSEUDO_EOF - 100, 4096)
+            .unwrap_err();
+        assert!(matches!(err, ClickFsError::ReadOrder { .. }));
     }
 }
