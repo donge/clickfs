@@ -14,11 +14,11 @@ use fuser::{
 use tokio::runtime::Handle;
 
 use crate::cache::TtlCache;
-use crate::driver::{self, HttpDriver};
+use crate::driver::{self, HttpDriver, TailConfig};
 use crate::error::{ClickFsError, Result};
 use crate::inode::{InodeTable, INO_ROOT};
 use crate::resolver::{self, PlanKind, QueryPlan};
-use crate::stream::StreamHandle;
+use crate::stream::{StreamHandle, TailContext};
 
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 4096;
@@ -38,6 +38,9 @@ pub struct ClickFs {
     uid: u32,
     gid: u32,
     start_time: SystemTime,
+    /// Configuration for tail-mode reverse-pread synthesis. Cloned into
+    /// each StreamAll handle's `TailContext`.
+    tail_cfg: TailConfig,
 
     // --- TTL caches ---
     // Empty key () for the global "list databases" call; tuple keys
@@ -51,12 +54,21 @@ pub struct ClickFs {
 }
 
 impl ClickFs {
-    pub fn new(driver: HttpDriver, rt: Handle, cache_ttl_ms: u64) -> Self {
+    pub fn new(driver: HttpDriver, rt: Handle, cache_ttl_ms: u64, tail_cfg: TailConfig) -> Self {
         let ttl = Duration::from_millis(cache_ttl_ms);
         if ttl.is_zero() {
             tracing::info!(target: "clickfs::cache", "metadata cache disabled");
         } else {
             tracing::info!(target: "clickfs::cache", ttl_ms = cache_ttl_ms, "metadata cache enabled");
+        }
+        if !tail_cfg.enabled {
+            tracing::info!(target: "clickfs::tail", "tail-mode disabled (--no-tail)");
+        } else {
+            tracing::info!(
+                target: "clickfs::tail",
+                rows = tail_cfg.rows,
+                "tail-mode enabled (large reverse pread → ORDER BY <pk> DESC LIMIT N)"
+            );
         }
         let fs = Self {
             driver,
@@ -67,6 +79,7 @@ impl ClickFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             start_time: SystemTime::now(),
+            tail_cfg,
             db_cache: Arc::new(TtlCache::new(ttl)),
             table_cache: Arc::new(TtlCache::new(ttl)),
             part_cache: Arc::new(TtlCache::new(ttl)),
@@ -269,6 +282,42 @@ impl ClickFs {
         let driver = self.driver.clone();
         let sql = driver::sql_describe(db, tbl);
         self.block_on(async move { driver.query_text(&sql).await.map_err(ClickFsError::Query) })
+    }
+
+    /// Resolve the ORDER BY expression to use for tail-mode synthesis.
+    /// Prefers `primary_key`, falls back to `sorting_key`, then to
+    /// `tuple()` (effectively unordered) for engines without a key.
+    /// Errors are non-fatal: we log and return `tuple()` so opens still
+    /// succeed even if `system.tables` is unreachable.
+    fn fetch_tail_order_expr(&self, db: &str, tbl: &str) -> String {
+        let driver = self.driver.clone();
+        let sql = driver::sql_table_pk(db, tbl);
+        let body = self
+            .rt
+            .block_on(async move { driver.query_text(&sql).await });
+        let body = match body {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(target: "clickfs::tail", db, tbl, error = %e, "pk lookup failed; falling back to tuple()");
+                return "tuple()".to_string();
+            }
+        };
+        // JSONEachRow → at most one line.
+        let line = body.lines().next().unwrap_or("");
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return "tuple()".to_string(),
+        };
+        let pk = v.get("primary_key").and_then(|x| x.as_str()).unwrap_or("");
+        if !pk.trim().is_empty() {
+            return pk.to_string();
+        }
+        let sk = v.get("sorting_key").and_then(|x| x.as_str()).unwrap_or("");
+        if !sk.trim().is_empty() {
+            return sk.to_string();
+        }
+        tracing::debug!(target: "clickfs::tail", db, tbl, "no primary_key/sorting_key; using tuple()");
+        "tuple()".to_string()
     }
 
     /// Cheap COUNT()-based existence probe. Returns Ok(()) only when the
@@ -552,8 +601,22 @@ impl Filesystem for ClickFs {
                 let db = plan.db.as_deref().unwrap();
                 let tbl = plan.table.as_deref().unwrap();
                 let sql = driver::sql_stream_all(db, tbl);
-                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
-                FileHandle::Stream(Arc::new(s))
+                if self.tail_cfg.enabled {
+                    // Resolve a usable ORDER BY expression for tail-mode
+                    // synthesis. One extra round-trip per open(); cheap.
+                    let order_expr = self.fetch_tail_order_expr(db, tbl);
+                    let tail = TailContext {
+                        db: db.to_string(),
+                        tbl: tbl.to_string(),
+                        order_expr,
+                        cfg: self.tail_cfg.clone(),
+                    };
+                    let s = StreamHandle::spawn_with_tail(&self.rt, self.driver.clone(), sql, tail);
+                    FileHandle::Stream(Arc::new(s))
+                } else {
+                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
+                    FileHandle::Stream(Arc::new(s))
+                }
             }
             PlanKind::StreamPartition(part) => {
                 let db = plan.db.as_deref().unwrap();
@@ -763,7 +826,7 @@ impl Filesystem for ClickFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{CompressionConfig, HttpDriver, TlsConfig};
+    use crate::driver::{CompressionConfig, HttpDriver, TailConfig, TlsConfig};
     use url::Url;
 
     fn unreachable_driver() -> HttpDriver {
@@ -788,7 +851,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let fs = ClickFs::new(unreachable_driver(), rt.handle().clone(), 0);
+        let fs = ClickFs::new(
+            unreachable_driver(),
+            rt.handle().clone(),
+            0,
+            TailConfig::default(),
+        );
         assert!(fs.db_cache.get(&()).is_none());
     }
 
@@ -801,7 +869,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let fs = ClickFs::new(unreachable_driver(), rt.handle().clone(), 2000);
+        let fs = ClickFs::new(
+            unreachable_driver(),
+            rt.handle().clone(),
+            2000,
+            TailConfig::default(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
         // Cache stays empty because the query errored out.
         assert!(fs.db_cache.get(&()).is_none());

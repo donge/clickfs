@@ -27,7 +27,7 @@ mod cli {
     use tracing_subscriber::EnvFilter;
     use url::Url;
 
-    use crate::driver::{CompressionConfig, HttpDriver, TlsConfig};
+    use crate::driver::{CompressionConfig, HttpDriver, TailConfig, TlsConfig};
     use crate::fs::ClickFs;
 
     #[derive(Parser, Debug)]
@@ -98,6 +98,22 @@ mod cli {
             /// raw SQL response in mount.log.
             #[arg(long, default_value_t = false)]
             no_compression: bool,
+
+            /// Disable tail-mode reverse-pread synthesis. By default a
+            /// large reverse pread (e.g. `tail -n 10 all.tsv`) triggers
+            /// a one-shot `SELECT * ORDER BY <pk> DESC LIMIT N` that is
+            /// served as a buffer pinned to the file's pseudo-EOF, so
+            /// the kernel `tail` works natively. With this flag any
+            /// reverse pread returns EIO (the v0.2 behavior).
+            #[arg(long, default_value_t = false)]
+            no_tail: bool,
+
+            /// Maximum rows materialized for a single tail-mode read.
+            /// `tail -n N` requests above this cap silently get the cap.
+            /// 10000 is plenty for human use, cheap on the server, and
+            /// fits comfortably in memory at typical row sizes.
+            #[arg(long, env = "CLICKFS_TAIL_ROWS", default_value_t = 10_000)]
+            tail_rows: u32,
         },
 
         /// Unmount a previously mounted clickfs.
@@ -128,6 +144,8 @@ mod cli {
                 ca_bundle,
                 cache_ttl_ms,
                 no_compression,
+                no_tail,
+                tail_rows,
             } => run_mount(
                 url,
                 mountpoint,
@@ -141,6 +159,8 @@ mod cli {
                 ca_bundle,
                 cache_ttl_ms,
                 no_compression,
+                no_tail,
+                tail_rows,
             ),
             Command::Umount { mountpoint } => run_umount(mountpoint),
         }
@@ -160,6 +180,8 @@ mod cli {
         ca_bundle: Option<PathBuf>,
         cache_ttl_ms: u64,
         no_compression: bool,
+        no_tail: bool,
+        tail_rows: u32,
     ) -> std::process::ExitCode {
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
@@ -198,6 +220,10 @@ mod cli {
         let compression = CompressionConfig {
             enabled: !no_compression,
         };
+        let tail_cfg = TailConfig {
+            enabled: !no_tail,
+            rows: tail_rows.max(1),
+        };
 
         let rt = match Runtime::new() {
             Ok(r) => r,
@@ -233,7 +259,7 @@ mod cli {
         }
         tracing::info!(url = %parsed_url, %user, "connected to clickhouse");
 
-        let fs = ClickFs::new(driver, rt.handle().clone(), cache_ttl_ms);
+        let fs = ClickFs::new(driver, rt.handle().clone(), cache_ttl_ms, tail_cfg);
 
         let mut options = vec![MountOption::FSName("clickfs".to_string()), MountOption::RO];
         // These options are Linux-only (libfuse / fusermount). macFUSE rejects them
