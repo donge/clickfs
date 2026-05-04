@@ -165,16 +165,8 @@ log viewers do), clickfs transparently issues a one-shot
 and serves the (row-reversed) result from an in-memory buffer pinned to
 the end of the file. The header line is preserved.
 
-* The buffer **expands on demand** through the ladder
-  `10 → 100 → 1000 → 10000`. `tail file` (default `-n 10`) costs one
-  `SELECT LIMIT 10`. `tail -n 100` climbs to `LIMIT 100` on the second
-  pread (so the first 10-row buffer is replaced). `tail -n 10000`
-  walks the full ladder. `tail -n 50000` stops at the 10000 cap and
-  the kernel `tail` then sees EIO past the buffer head.
-* Default cap: `10000` rows (≈10 MB at typical row sizes — friendly
-  to AI agents reading the buffer). Tune *down* with `--tail-rows N`
-  / `CLICKFS_TAIL_ROWS`; values are clamped to `1..=10000`. Disable
-  the whole feature with `--no-tail`.
+* Default: enabled, `N = 10000`. Tune with `--tail-rows N` /
+  `CLICKFS_TAIL_ROWS`, or disable with `--no-tail`.
 * The ORDER BY column list comes from `system.tables.primary_key`,
   falling back to `sorting_key`, then `tuple()` for engines without a
   key (Memory/Log/StripeLog).
