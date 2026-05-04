@@ -1,0 +1,40 @@
+[package]
+name = "clickfs"
+version = "0.0.1"
+edition = "2021"
+description = "Mount ClickHouse as a POSIX filesystem"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "clickfs"
+path = "src/main.rs"
+
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser"]
+
+[dependencies]
+fuser = { version = "0.14", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+bytes = "1"
+futures = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+ahash = "0.8"
+dashmap = "6"
+libc = "0.2"
+url = "2"
+once_cell = "1"
+
+# On macOS, fuser must link against macFUSE's libfuse; the pure-Rust ABI path
+# is Linux-only. Enable the default features (libfuse + libfuse3) here so
+# `cargo build` works once macFUSE is installed (`brew install --cask macfuse`).
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.14", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
