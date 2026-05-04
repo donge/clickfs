@@ -379,17 +379,6 @@ pub fn sql_stream_partition(db: &str, tbl: &str, partition: &str) -> String {
     )
 }
 
-/// First N rows in newline-delimited JSON. Used for both `head.ndjson`
-/// (streamed directly) and the README "Sample" section (5 rows).
-pub fn sql_head_ndjson(db: &str, tbl: &str, limit: u32) -> String {
-    format!(
-        "SELECT * FROM {}.{} LIMIT {} FORMAT JSONEachRow",
-        quote_ident(db),
-        quote_ident(tbl),
-        limit
-    )
-}
-
 /// Aggregate stats from system.parts (active parts only). Returns a
 /// single row TSVRaw: rows, bytes_on_disk, parts, partitions, min_time?, max_time?.
 /// `min_time`/`max_time` are NULL on tables without a partition-level

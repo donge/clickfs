@@ -45,7 +45,6 @@ Everything is streamed — no temp files, no buffering of full result sets.
         └── <table>/
             ├── .schema       # SHOW CREATE TABLE output
             ├── README.md     # AI/agent-friendly summary (regenerated on open)
-            ├── head.ndjson   # first 100 rows in JSONEachRow
             ├── all.tsv       # full table, TSVWithNames
             └── <part_id>.tsv # one file per partition_id
 ```
@@ -62,9 +61,6 @@ sub-queries (`DESCRIBE`, aggregate stats from `system.parts`,
 and **Files** — everything an agent needs to understand a table
 without writing SQL. Failed sub-queries degrade to `_(unavailable)_`
 so a missing privilege never black-holes the file.
-
-`head.ndjson` is `LIMIT 100` of `JSONEachRow`, ideal for piping to
-`jq`. It always terminates, even on billion-row tables.
 
 ---
 

@@ -266,7 +266,6 @@ impl ClickFs {
             (PlanKind::ListPartitions, Some(db), Some(t))
             | (PlanKind::DescribeTable, Some(db), Some(t))
             | (PlanKind::Readme, Some(db), Some(t))
-            | (PlanKind::HeadNdjson, Some(db), Some(t))
             | (PlanKind::StreamAll, Some(db), Some(t)) => {
                 if self.fetch_tables(db)?.iter().any(|x| x == t) {
                     Ok(())
@@ -416,7 +415,6 @@ impl Filesystem for ClickFs {
                     // matters only for human aesthetics — kernel sorts.
                     entries.push((FileType::RegularFile, ".schema".to_string()));
                     entries.push((FileType::RegularFile, "README.md".to_string()));
-                    entries.push((FileType::RegularFile, "head.ndjson".to_string()));
                     entries.push((FileType::RegularFile, "all.tsv".to_string()));
                     // Partitions (may be empty for non-partitioned tables).
                     match self.fetch_partitions(db, tbl) {
@@ -510,15 +508,6 @@ impl Filesystem for ClickFs {
                 FileHandle::Special {
                     bytes: Arc::new(text.into_bytes()),
                 }
-            }
-            PlanKind::HeadNdjson => {
-                let db = plan.db.as_deref().unwrap();
-                let tbl = plan.table.as_deref().unwrap();
-                // 100 rows is plenty for `cat | jq` reconnaissance and
-                // small enough that we don't need streaming back-pressure.
-                let sql = driver::sql_head_ndjson(db, tbl, 100);
-                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
-                FileHandle::Stream(Arc::new(s))
             }
             PlanKind::StreamAll => {
                 let db = plan.db.as_deref().unwrap();

@@ -426,32 +426,6 @@ expect_zero   "T36d README.md has Sample section" \
 expect_zero   "T36e README.md has Files section" \
               bash -c "grep -q '^## Files' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
 
-# T37: head.ndjson pseudo-file streams JSONEachRow, one object per
-# line, bounded by LIMIT (so it terminates even on huge tables).
-expect_zero   "T37 head.ndjson is listed in table dir" \
-              bash -c "ls '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/' | grep -qx 'head.ndjson'"
-expect_zero   "T37a head.ndjson is valid JSON-per-line and bounded" \
-              bash -c "
-                # Read the file (LIMIT 100 inside) and check every
-                # non-empty line looks like a JSON object: starts with
-                # '{', ends with '}'. ClickHouse JSONEachRow output is
-                # well-formed by construction, so a structural check is
-                # sufficient and avoids depending on python3.
-                cat '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/head.ndjson' | \
-                  awk 'NF{print}' | \
-                  while IFS= read -r line; do
-                    case \"\$line\" in
-                      '{'*'}') ;;
-                      *) exit 1 ;;
-                    esac
-                  done
-              "
-expect_zero   "T37b head.ndjson terminates (LIMIT 100 enforced)" \
-              bash -c "
-                COUNT=\$(cat '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/head.ndjson' | awk 'NF' | wc -l | tr -d ' ')
-                test \"\$COUNT\" -le 100 -a \"\$COUNT\" -gt 0
-              "
-
 # T38: tail-buffer materialization via reverse pread.
 #
 # A read whose offset lands deep inside the pseudo-EOF window

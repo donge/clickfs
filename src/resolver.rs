@@ -17,9 +17,6 @@ pub enum PlanKind {
     /// (schema + stats + sample + example queries). Synthesized by
     /// concurrently issuing 5 sub-queries; rendered in-memory.
     Readme,
-    /// "/db/<db>/<tbl>/head.ndjson" — first N rows in JSONEachRow.
-    /// Streamed (no full materialization) but bounded by LIMIT.
-    HeadNdjson,
     StreamAll,               // "/db/<db>/<tbl>/all.tsv"
     StreamPartition(String), // "/db/<db>/<tbl>/<partition>.tsv"
 }
@@ -50,7 +47,7 @@ impl QueryPlan {
     pub fn is_stream_file(&self) -> bool {
         matches!(
             self.kind,
-            PlanKind::StreamAll | PlanKind::StreamPartition(_) | PlanKind::HeadNdjson
+            PlanKind::StreamAll | PlanKind::StreamPartition(_)
         )
     }
 }
@@ -138,11 +135,6 @@ pub fn resolve(path: &Path) -> Result<QueryPlan> {
                     db: Some(db),
                     table: Some(tbl),
                 }),
-                "head.ndjson" => Ok(QueryPlan {
-                    kind: PlanKind::HeadNdjson,
-                    db: Some(db),
-                    table: Some(tbl),
-                }),
                 "all.tsv" => Ok(QueryPlan {
                     kind: PlanKind::StreamAll,
                     db: Some(db),
@@ -222,11 +214,5 @@ mod tests {
         assert!(matches!(p.kind, PlanKind::Readme));
         assert_eq!(p.db.as_deref(), Some("default"));
         assert_eq!(p.table.as_deref(), Some("users"));
-    }
-
-    #[test]
-    fn head_ndjson() {
-        let p = r("/db/default/users/head.ndjson").unwrap();
-        assert!(matches!(p.kind, PlanKind::HeadNdjson));
     }
 }

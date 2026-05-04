@@ -37,7 +37,11 @@ pub async fn render(driver: &HttpDriver, db: &str, tbl: &str) -> String {
         driver::quote_ident(db),
         driver::quote_ident(tbl)
     );
-    let sql_sample = driver::sql_head_ndjson(db, tbl, 5);
+    let sql_sample = format!(
+        "SELECT * FROM {}.{} LIMIT 5 FORMAT JSONEachRow",
+        driver::quote_ident(db),
+        driver::quote_ident(tbl)
+    );
 
     // Fire all five queries in parallel. Per-query timeouts are bounded
     // by the driver's max_execution_time setting.
@@ -112,10 +116,6 @@ pub async fn render(driver: &HttpDriver, db: &str, tbl: &str) -> String {
          Inspect a single partition:\n\
          ```bash\n\
          cat /<mountpoint>/db/{db}/{tbl}/<partition_id>.tsv\n\
-         ```\n\n\
-         First 100 rows as JSON, easy to pipe to `jq`:\n\
-         ```bash\n\
-         cat /<mountpoint>/db/{db}/{tbl}/head.ndjson | jq .\n\
          ```\n",
         db = db,
         tbl = tbl
@@ -128,7 +128,6 @@ pub async fn render(driver: &HttpDriver, db: &str, tbl: &str) -> String {
     out.push_str("|---|---|\n");
     out.push_str("| `.schema` | `SHOW CREATE TABLE` output |\n");
     out.push_str("| `README.md` | This file (regenerated on open) |\n");
-    out.push_str("| `head.ndjson` | First N rows as JSON (one per line) |\n");
     out.push_str("| `all.tsv` | Full table stream, TSV with header |\n");
     out.push_str("| `<partition>.tsv` | Single partition stream |\n");
 
