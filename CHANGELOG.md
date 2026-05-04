@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tail-mode for `all.tsv`.** Reading near the end of the synthetic
+  `all.tsv` file (the way `tail -n N`, `less +G`, and most log viewers
+  do) no longer fails with `EIO`. The file now advertises a virtual
+  EOF at `2^63`; when a reader pread()s deep inside that pseudo-EOF
+  window, clickfs transparently issues a one-shot
+  `SELECT * FROM <db>.<tbl> ORDER BY <pk> DESC LIMIT N
+   FORMAT TabSeparatedWithNames` and serves the (row-reversed) result
+  from an in-memory buffer pinned to the end of the file. The header
+  line is preserved.
+  - Default: enabled, `N = 10000`. Tune with `--tail-rows N` or
+    `CLICKFS_TAIL_ROWS=N`; disable entirely with `--no-tail`.
+  - The `ORDER BY` column list comes from `system.tables.primary_key`,
+    falling back to `sorting_key`, then `tuple()` for engines without
+    a key (Memory, Log, StripeLog).
+  - Multi-column primary keys correctly emit `DESC` per column
+    (`ORDER BY a DESC, b DESC, c DESC`) — using a single trailing
+    `DESC` would have only sorted the last column descending.
+- 5 new unit tests on `stream::` (8 total) and 4 on `driver::` covering
+  tail buffer materialization, pseudo-EOF window math, header
+  preservation across row reversal, the `--no-tail` disabled path, and
+  the per-column `DESC` SQL fix.
+- 5 new e2e cases (T38..T38d) exercising tail-mode end-to-end via
+  `dd bs=1 skip=<PSEUDO_EOF-N>`, plus `--help` smoke tests for the new
+  CLI flags.
+
+### Changed
+
+- `e2e.sh` no longer depends on `python3`. The reverse-pread driver
+  switched to `dd bs=1 skip=N count=M` (works identically on Linux
+  and macOS), and the `head.ndjson` JSON validator switched to a
+  structural shell check (`{...}` per line). The previous T31/T31a
+  e2e cases that relied on `python3 -c "os.pread(...)"` were dropped;
+  the underlying contract is exhaustively pinned by
+  `stream::tests::reverse_seek_warns_once_and_errors` and
+  `stream::tests::tail_disabled_keeps_reverse_seek_eio`.
+- The "reverse seek not supported" log line was demoted from `warn`
+  to `debug`. Tail-mode now handles the common case (`tail`, `less`),
+  so the message had become noise rather than a useful hint.
+
 ## [0.2.0] - 2026-05-04
 
 ### Added
