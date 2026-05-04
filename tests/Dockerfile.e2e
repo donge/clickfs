@@ -1,0 +1,22 @@
+# Image used by tests/e2e-docker.sh to run the clickfs end-to-end suite
+# on Linux from a macOS host. Includes the Rust toolchain so the binary
+# is built fresh inside the container (Mach-O artifacts from a host
+# `cargo build` are not portable into Linux).
+FROM rust:slim
+
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libfuse-dev \
+        fuse \
+        curl \
+        ca-certificates \
+        procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# Source tree and the Linux-only target dir are bind-mounted at /work.
+WORKDIR /work
+
+# tests/e2e-docker.sh sets CARGO_TARGET_DIR=/work/target-linux to keep
+# Linux build artifacts isolated from any macOS host build under target/.
+ENTRYPOINT ["/work/tests/e2e.sh"]
