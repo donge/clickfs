@@ -3,3 +3,7 @@
 /.cache
 **/*.rs.bk
 .DS_Store
+
+# stray release binaries
+/clickfs-amd64
+/clickfs-amd64-musl

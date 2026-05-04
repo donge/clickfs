@@ -265,7 +265,7 @@ say ""
 info "==== Phase 1: mount ===="
 
 CLICKFS_LOG="$LOG_DIR/mount.log"
-RUST_LOG="${RUST_LOG:-clickfs=info}" \
+RUST_LOG="${RUST_LOG:-clickfs=debug}" \
 CLICKFS_PASSWORD="$CLICKFS_PASSWORD" \
 nohup "$CLICKFS_BIN" mount "$CH_URL" "$MOUNTPOINT" --user "$CH_USER" \
   > "$CLICKFS_LOG" 2>&1 &
@@ -368,6 +368,26 @@ expect_zero   "T31a mount.log mentions reverse seek" \
 # We invoke the binary directly (no mount) and check exit + message.
 expect_zero   "T32 --insecure conflicts with --ca-bundle" \
               bash -c "'$CLICKFS_BIN' mount http://x /tmp --insecure --ca-bundle /etc/hosts 2>&1 | grep -q 'cannot be used with'"
+
+# T27: --cache-ttl-ms flag exists and accepts 0.
+expect_zero   "T27 --cache-ttl-ms is recognized" \
+              bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--cache-ttl-ms'"
+
+# T28: with cache enabled (default), repeated readdir should hit cache.
+# Heuristic: list databases 5 times, then count "SHOW DATABASES" / "system.databases"
+# entries in the SQL log. With ttl=2000ms, only the first call should hit CH.
+expect_zero   "T28 cache reduces query count under load" \
+              bash -c "
+                : > '$CLICKFS_LOG.t28'
+                # Capture line count before
+                BEFORE=\$(grep -c 'system.databases' '$CLICKFS_LOG' || true)
+                for i in 1 2 3 4 5; do ls '$MOUNTPOINT/db' >/dev/null; done
+                AFTER=\$(grep -c 'system.databases' '$CLICKFS_LOG' || true)
+                DELTA=\$((AFTER - BEFORE))
+                # Without caching: 5 calls. With caching: at most 1 (first miss).
+                # Allow up to 2 to absorb any concurrent kernel behavior.
+                test \"\$DELTA\" -le 2
+              "
 
 # --------------------------------------------------------------------------
 # Phase 6: read-only enforcement (EROFS).

@@ -13,6 +13,7 @@ use fuser::{
 };
 use tokio::runtime::Handle;
 
+use crate::cache::TtlCache;
 use crate::driver::{self, HttpDriver};
 use crate::error::{ClickFsError, Result};
 use crate::inode::{InodeTable, INO_ROOT};
@@ -37,10 +38,25 @@ pub struct ClickFs {
     uid: u32,
     gid: u32,
     start_time: SystemTime,
+
+    // --- TTL caches ---
+    // Empty key () for the global "list databases" call; tuple keys
+    // for table/partition listings; (db, opt-table, opt-partition)
+    // for existence probes.
+    db_cache: Arc<TtlCache<(), Vec<String>>>,
+    table_cache: Arc<TtlCache<String, Vec<String>>>,
+    part_cache: Arc<TtlCache<(String, String), Vec<String>>>,
+    exists_cache: Arc<TtlCache<(String, Option<String>, Option<String>), bool>>,
 }
 
 impl ClickFs {
-    pub fn new(driver: HttpDriver, rt: Handle) -> Self {
+    pub fn new(driver: HttpDriver, rt: Handle, cache_ttl_ms: u64) -> Self {
+        let ttl = Duration::from_millis(cache_ttl_ms);
+        if ttl.is_zero() {
+            tracing::info!(target: "clickfs::cache", "metadata cache disabled");
+        } else {
+            tracing::info!(target: "clickfs::cache", ttl_ms = cache_ttl_ms, "metadata cache enabled");
+        }
         Self {
             driver,
             rt,
@@ -50,6 +66,10 @@ impl ClickFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             start_time: SystemTime::now(),
+            db_cache: Arc::new(TtlCache::new(ttl)),
+            table_cache: Arc::new(TtlCache::new(ttl)),
+            part_cache: Arc::new(TtlCache::new(ttl)),
+            exists_cache: Arc::new(TtlCache::new(ttl)),
         }
     }
 
@@ -119,8 +139,11 @@ impl ClickFs {
     }
 
     fn fetch_databases(&self) -> Result<Vec<String>> {
+        if let Some(v) = self.db_cache.get(&()) {
+            return Ok(v);
+        }
         let driver = self.driver.clone();
-        self.block_on(async move {
+        let v: Vec<String> = self.block_on(async move {
             let body = driver
                 .query_text(&driver::sql_list_databases())
                 .await
@@ -130,26 +153,37 @@ impl ClickFs {
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .collect())
-        })
+        })?;
+        self.db_cache.insert((), v.clone());
+        Ok(v)
     }
 
     fn fetch_tables(&self, db: &str) -> Result<Vec<String>> {
+        if let Some(v) = self.table_cache.get(&db.to_string()) {
+            return Ok(v);
+        }
         let driver = self.driver.clone();
         let sql = driver::sql_list_tables(db);
-        self.block_on(async move {
+        let v: Vec<String> = self.block_on(async move {
             let body = driver.query_text(&sql).await.map_err(ClickFsError::Query)?;
             Ok(body
                 .lines()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .collect())
-        })
+        })?;
+        self.table_cache.insert(db.to_string(), v.clone());
+        Ok(v)
     }
 
     fn fetch_partitions(&self, db: &str, tbl: &str) -> Result<Vec<String>> {
+        let key = (db.to_string(), tbl.to_string());
+        if let Some(v) = self.part_cache.get(&key) {
+            return Ok(v);
+        }
         let driver = self.driver.clone();
         let sql = driver::sql_list_partitions(db, tbl);
-        self.block_on(async move {
+        let v: Vec<String> = self.block_on(async move {
             let body = driver.query_text(&sql).await.map_err(ClickFsError::Query)?;
             Ok(body
                 .lines()
@@ -160,7 +194,9 @@ impl ClickFs {
                 // the always-present whole-table file. Drop it.
                 .filter(|s| s != "all")
                 .collect())
-        })
+        })?;
+        self.part_cache.insert(key, v.clone());
+        Ok(v)
     }
 
     fn fetch_describe(&self, db: &str, tbl: &str) -> Result<String> {
@@ -173,10 +209,35 @@ impl ClickFs {
     /// referenced object actually exists in ClickHouse; otherwise NotFound.
     fn verify_plan_exists(&self, plan: &resolver::QueryPlan) -> Result<()> {
         use resolver::PlanKind;
+        // Build cache key matching the SQL we'd send. Roots are always
+        // present and skip the cache + the query.
+        let cache_key: Option<(String, Option<String>, Option<String>)> =
+            match (&plan.kind, plan.db.as_deref(), plan.table.as_deref()) {
+                (PlanKind::Root, _, _) | (PlanKind::DbNamespace, _, _) => return Ok(()),
+                (PlanKind::ListTables, Some(db), _) => Some((db.to_string(), None, None)),
+                (PlanKind::ListPartitions, Some(db), Some(t))
+                | (PlanKind::DescribeTable, Some(db), Some(t))
+                | (PlanKind::StreamAll, Some(db), Some(t)) => {
+                    Some((db.to_string(), Some(t.to_string()), None))
+                }
+                (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
+                    Some((db.to_string(), Some(t.to_string()), Some(part.to_string())))
+                }
+                _ => return Err(ClickFsError::NotFound),
+            };
+
+        if let Some(key) = &cache_key {
+            if let Some(exists) = self.exists_cache.get(key) {
+                return if exists {
+                    Ok(())
+                } else {
+                    Err(ClickFsError::NotFound)
+                };
+            }
+        }
+
         let driver = self.driver.clone();
         let sql = match (&plan.kind, plan.db.as_deref(), plan.table.as_deref()) {
-            // Roots are always present; nothing to check.
-            (PlanKind::Root, _, _) | (PlanKind::DbNamespace, _, _) => return Ok(()),
             (PlanKind::ListTables, Some(db), _) => driver::sql_exists_database(db),
             (PlanKind::ListPartitions, Some(db), Some(t))
             | (PlanKind::DescribeTable, Some(db), Some(t))
@@ -184,13 +245,16 @@ impl ClickFs {
             (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
                 driver::sql_exists_partition(db, t, part)
             }
-            // Defensive: any plan that lacks the expected db/table is bogus.
-            _ => return Err(ClickFsError::NotFound),
+            _ => unreachable!("filtered above"),
         };
         let body = self
             .block_on(async move { driver.query_text(&sql).await.map_err(ClickFsError::Query) })?;
         let n: u64 = body.trim().parse().unwrap_or(0);
-        if n == 0 {
+        let exists = n != 0;
+        if let Some(key) = cache_key {
+            self.exists_cache.insert(key, exists);
+        }
+        if !exists {
             Err(ClickFsError::NotFound)
         } else {
             Ok(())

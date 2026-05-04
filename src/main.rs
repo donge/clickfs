@@ -1,5 +1,6 @@
 //! ClickFS CLI entrypoint.
 
+mod cache;
 mod driver;
 mod error;
 #[cfg(feature = "fuse")]
@@ -79,6 +80,13 @@ mod cli {
             /// with --insecure.
             #[arg(long, value_name = "PATH")]
             ca_bundle: Option<PathBuf>,
+
+            /// TTL for the metadata cache (db/table/partition listings
+            /// and existence probes), in milliseconds. Set to 0 to
+            /// disable caching entirely. Default 2000ms keeps repeated
+            /// `ls`/`find` cheap without hiding schema changes for long.
+            #[arg(long, env = "CLICKFS_CACHE_TTL_MS", default_value_t = 2000)]
+            cache_ttl_ms: u64,
         },
 
         /// Unmount a previously mounted clickfs.
@@ -107,6 +115,7 @@ mod cli {
                 auto_unmount,
                 insecure,
                 ca_bundle,
+                cache_ttl_ms,
             } => run_mount(
                 url,
                 mountpoint,
@@ -118,6 +127,7 @@ mod cli {
                 auto_unmount,
                 insecure,
                 ca_bundle,
+                cache_ttl_ms,
             ),
             Command::Umount { mountpoint } => run_umount(mountpoint),
         }
@@ -135,6 +145,7 @@ mod cli {
         auto_unmount: bool,
         insecure: bool,
         ca_bundle: Option<PathBuf>,
+        cache_ttl_ms: u64,
     ) -> std::process::ExitCode {
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
@@ -204,7 +215,7 @@ mod cli {
         }
         tracing::info!(url = %parsed_url, %user, "connected to clickhouse");
 
-        let fs = ClickFs::new(driver, rt.handle().clone());
+        let fs = ClickFs::new(driver, rt.handle().clone(), cache_ttl_ms);
 
         let mut options = vec![MountOption::FSName("clickfs".to_string()), MountOption::RO];
         // These options are Linux-only (libfuse / fusermount). macFUSE rejects them
