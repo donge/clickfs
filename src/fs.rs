@@ -286,6 +286,24 @@ impl ClickFs {
     }
 }
 
+/// Generates a `fuser::Filesystem` method that takes the named arguments
+/// (in addition to `&mut self` + `_req: &Request<'_>`) plus a `reply` of
+/// the given type, and immediately calls `reply.error(libc::EROFS)`.
+/// Used to declare the read-only stubs concisely.
+macro_rules! erofs_stub {
+    (fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $reply:ty) => {
+        fn $name(
+            &mut self,
+            _req: &Request<'_>,
+            $($arg: $ty,)*
+            reply: $reply,
+        ) {
+            let _ = ($($arg,)*);
+            reply.error(libc::EROFS);
+        }
+    };
+}
+
 impl Filesystem for ClickFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.path_of(parent) {
@@ -613,100 +631,63 @@ impl Filesystem for ClickFs {
 
     // --- Read-only enforcement: reject all mutating operations. ---
 
-    fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        reply.error(libc::EROFS);
-    }
-
-    fn mknod(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(libc::EROFS);
-    }
-
-    fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(libc::EROFS);
-    }
-
-    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(libc::EROFS);
-    }
-
-    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(libc::EROFS);
-    }
-
-    fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _newparent: u64,
-        _newname: &OsStr,
-        _flags: u32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(libc::EROFS);
-    }
-
-    fn create(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: fuser::ReplyCreate,
-    ) {
-        reply.error(libc::EROFS);
-    }
-
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: fuser::ReplyWrite,
-    ) {
-        reply.error(libc::EROFS);
-    }
+    // --- Read-only stubs ---
+    //
+    // The filesystem is mounted read-only; every mutating fuser op short-
+    // circuits to EROFS. The macro keeps the surface honest without 90
+    // lines of identical bodies.
+    erofs_stub!(
+        fn setattr(
+            _ino: u64,
+            _mode: Option<u32>,
+            _uid: Option<u32>,
+            _gid: Option<u32>,
+            _size: Option<u64>,
+            _atime: Option<fuser::TimeOrNow>,
+            _mtime: Option<fuser::TimeOrNow>,
+            _ctime: Option<SystemTime>,
+            _fh: Option<u64>,
+            _crtime: Option<SystemTime>,
+            _chgtime: Option<SystemTime>,
+            _bkuptime: Option<SystemTime>,
+            _flags: Option<u32>,
+        ) -> ReplyAttr
+    );
+    erofs_stub!(
+        fn mknod(_parent: u64, _name: &OsStr, _mode: u32, _umask: u32, _rdev: u32) -> ReplyEntry
+    );
+    erofs_stub!(fn mkdir(_parent: u64, _name: &OsStr, _mode: u32, _umask: u32) -> ReplyEntry);
+    erofs_stub!(fn unlink(_parent: u64, _name: &OsStr) -> ReplyEmpty);
+    erofs_stub!(fn rmdir(_parent: u64, _name: &OsStr) -> ReplyEmpty);
+    erofs_stub!(
+        fn rename(
+            _parent: u64,
+            _name: &OsStr,
+            _newparent: u64,
+            _newname: &OsStr,
+            _flags: u32,
+        ) -> ReplyEmpty
+    );
+    erofs_stub!(
+        fn create(
+            _parent: u64,
+            _name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            _flags: i32,
+        ) -> fuser::ReplyCreate
+    );
+    erofs_stub!(
+        fn write(
+            _ino: u64,
+            _fh: u64,
+            _offset: i64,
+            _data: &[u8],
+            _write_flags: u32,
+            _flags: i32,
+            _lock_owner: Option<u64>,
+        ) -> fuser::ReplyWrite
+    );
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         // Pseudo capacity so `df` doesn't choke. Stay well under i64::MAX so
