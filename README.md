@@ -105,14 +105,17 @@ clickfs mount <URL> <MOUNTPOINT> [options]
 
 Common options:
 
-| Flag                  | Default          | Description                          |
-| --------------------- | ---------------- | ------------------------------------ |
-| `--user`              | `default`        | ClickHouse user (or `CLICKFS_USER` env)     |
-| `--password`          | *(empty)*        | Password (or `CLICKFS_PASSWORD` env, recommended) |
-| `--allow-other`       | off              | Let other UIDs see the mount         |
-| `--auto-unmount`      | on               | Unmount automatically on process exit |
-| `--query-timeout`     | `60`             | Server-side query timeout (seconds)  |
-| `--max-result-bytes`  | `1073741824`     | Per-query byte cap (1 GiB)           |
+| Flag                   | Default          | Description                          |
+| ---------------------- | ---------------- | ------------------------------------ |
+| `--user`               | `default`        | ClickHouse user (or `CLICKFS_USER` env)     |
+| `--password`           | *(empty)*        | Password (or `CLICKFS_PASSWORD` env, recommended) |
+| `--allow-other`        | off              | Let other UIDs see the mount         |
+| `--no-auto-unmount`    | off              | Keep the mount alive after the process exits (Linux) |
+| `--query-timeout`      | `60`             | Server-side query timeout (seconds)  |
+| `--max-result-bytes`   | `1073741824`     | Per-query byte cap (1 GiB)           |
+| `--cache-ttl-ms`       | `2000`           | Metadata cache TTL (or `CLICKFS_CACHE_TTL_MS`); `0` disables |
+| `--insecure`           | off              | Skip TLS cert + hostname verification (dev only) |
+| `--ca-bundle <PATH>`   | *(unset)*        | Extra PEM CA bundle to trust on top of system roots |
 
 Example:
 
@@ -184,11 +187,14 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design, plus:
 
 ## Limitations (v1)
 
-- HTTP protocol only (no native TCP)
+- HTTP/HTTPS protocol only (no native TCP)
 - Read-only
 - TSV output only (TSVWithNames for `all.tsv`)
-- Strict-sequential reads per fd
-- No caching of directory listings (one query per `ls`)
+- Strict-sequential reads per fd; reverse seeks fail with EIO and a
+  one-shot warning suggesting `cat | tail -n N` or `head -c N | tail`
+- Metadata listings (db/table/partition/existence) are cached for
+  `--cache-ttl-ms` (default 2000 ms); `.schema` and data streams are
+  always fresh
 - No KILL QUERY on cancel — relies on dropped HTTP connection +
   `max_execution_time`
 - Single ClickHouse server; no cluster / replica routing
@@ -197,8 +203,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design, plus:
 
 ## Tests
 
-- Unit tests: `cargo test --no-default-features` (11 cases, no FUSE needed)
-- End-to-end: [`tests/e2e.sh`](tests/e2e.sh) — 26 cases against a real
+- Unit tests: `cargo test --bin clickfs` (33 cases, no FUSE needed)
+- End-to-end: [`tests/e2e.sh`](tests/e2e.sh) — 31 cases against a real
   ClickHouse + mounted FUSE. See [`tests/README.md`](tests/README.md).
 
 ```sh
