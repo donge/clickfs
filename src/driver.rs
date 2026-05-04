@@ -53,6 +53,26 @@ impl Default for CompressionConfig {
     }
 }
 
+/// Tail-mode config: how `tail -n N all.tsv` is synthesized.
+///
+/// When `enabled`, a large reverse pread (offset > cursor + 32 MiB)
+/// triggers a one-shot `SELECT * ORDER BY <pk> DESC LIMIT rows` that is
+/// then served as a tail buffer pinned to the file's pseudo-EOF.
+#[derive(Clone, Debug)]
+pub struct TailConfig {
+    pub enabled: bool,
+    pub rows: u32,
+}
+
+impl Default for TailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rows: 10_000,
+        }
+    }
+}
+
 /// Convert a non-success HTTP response into a `QueryError`, preferring a
 /// structured `QueryError::ClickHouse` when we can parse one out of the
 /// `X-ClickHouse-Exception-Code` header or the body.
@@ -426,6 +446,48 @@ pub fn sql_stats(db: &str, tbl: &str) -> String {
     )
 }
 
+/// primary_key + sorting_key for a table, JSONEachRow. Either field may
+/// be empty (e.g. Memory/Log/StripeLog engines have no key); the caller
+/// then falls back to `tuple()` for the tail ORDER BY.
+pub fn sql_table_pk(db: &str, tbl: &str) -> String {
+    format!(
+        "SELECT primary_key, sorting_key \
+         FROM system.tables \
+         WHERE database = {} AND name = {} \
+         FORMAT JSONEachRow",
+        quote_string(db),
+        quote_string(tbl)
+    )
+}
+
+/// `SELECT *` ordered DESC by `order_expr` (already a comma-separated
+/// column list, or the literal `tuple()`), limited to N rows. Used to
+/// materialize the tail buffer when a reader does a large reverse pread.
+/// Output is `TabSeparatedWithNames`; caller is responsible for
+/// reversing the data rows so the buffer reads "oldest first".
+pub fn sql_select_tail(db: &str, tbl: &str, order_expr: &str, limit: u32) -> String {
+    // For multi-column keys we must apply DESC to every column, not just
+    // the trailing one (`a, b DESC` only sorts b descending). `tuple()`
+    // is a single expression so the simple form still works.
+    let trimmed = order_expr.trim();
+    let order_clause = if trimmed.is_empty() || trimmed == "tuple()" {
+        format!("{} DESC", trimmed)
+    } else {
+        trimmed
+            .split(',')
+            .map(|c| format!("{} DESC", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "SELECT * FROM {}.{} ORDER BY {} LIMIT {} FORMAT TabSeparatedWithNames",
+        quote_ident(db),
+        quote_ident(tbl),
+        order_clause,
+        limit
+    )
+}
+
 /// Column metadata: name + type + comment. JSONEachRow so the README
 /// renderer can deserialize without fighting TSV escaping.
 pub fn sql_columns(db: &str, tbl: &str) -> String {
@@ -562,5 +624,40 @@ mod tests {
             !sql.contains("enable_http_compression"),
             "expected NO enable_http_compression in SQL, got: {sql}"
         );
+    }
+
+    #[test]
+    fn sql_table_pk_targets_system_tables() {
+        let s = sql_table_pk("d", "t");
+        assert!(s.contains("system.tables"));
+        assert!(s.contains("primary_key"));
+        assert!(s.contains("sorting_key"));
+        assert!(s.contains("'d'"));
+        assert!(s.contains("'t'"));
+        assert!(s.ends_with("FORMAT JSONEachRow"));
+    }
+
+    #[test]
+    fn sql_select_tail_quotes_ident_and_orders_desc() {
+        let s = sql_select_tail("my db", "my tbl", "id", 10);
+        assert!(s.contains("`my db`.`my tbl`"));
+        assert!(s.contains("ORDER BY id DESC"));
+        assert!(s.contains("LIMIT 10"));
+        assert!(s.ends_with("FORMAT TabSeparatedWithNames"));
+    }
+
+    #[test]
+    fn sql_select_tail_accepts_tuple_fallback() {
+        let s = sql_select_tail("d", "t", "tuple()", 5);
+        assert!(s.contains("ORDER BY tuple() DESC"));
+    }
+
+    #[test]
+    fn sql_select_tail_applies_desc_per_column() {
+        // Multi-column key must DESC every column, not just the last,
+        // otherwise ClickHouse only sorts the trailing column descending.
+        let s = sql_select_tail("d", "t", "a, b, c", 7);
+        assert!(s.contains("ORDER BY a DESC, b DESC, c DESC"), "got: {s}");
+        assert!(s.contains("LIMIT 7"));
     }
 }
