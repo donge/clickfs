@@ -83,13 +83,6 @@ mod cli {
             #[arg(long, value_name = "PATH")]
             ca_bundle: Option<PathBuf>,
 
-            /// TTL for the metadata cache (db/table/partition listings
-            /// and existence probes), in milliseconds. Set to 0 to
-            /// disable caching entirely. Default 2000ms keeps repeated
-            /// `ls`/`find` cheap without hiding schema changes for long.
-            #[arg(long, env = "CLICKFS_CACHE_TTL_MS", default_value_t = 2000)]
-            cache_ttl_ms: u64,
-
             /// Disable HTTP gzip compression. By default clickfs sends
             /// `Accept-Encoding: gzip` and asks ClickHouse to compress
             /// the response (`enable_http_compression=1`), which is
@@ -142,7 +135,6 @@ mod cli {
                 no_auto_unmount,
                 insecure,
                 ca_bundle,
-                cache_ttl_ms,
                 no_compression,
                 no_tail,
                 tail_rows,
@@ -157,7 +149,6 @@ mod cli {
                 no_auto_unmount,
                 insecure,
                 ca_bundle,
-                cache_ttl_ms,
                 no_compression,
                 no_tail,
                 tail_rows,
@@ -178,7 +169,6 @@ mod cli {
         no_auto_unmount: bool,
         insecure: bool,
         ca_bundle: Option<PathBuf>,
-        cache_ttl_ms: u64,
         no_compression: bool,
         no_tail: bool,
         tail_rows: u32,
@@ -259,7 +249,7 @@ mod cli {
         }
         tracing::info!(url = %parsed_url, %user, "connected to clickhouse");
 
-        let fs = ClickFs::new(driver, rt.handle().clone(), cache_ttl_ms, tail_cfg);
+        let fs = ClickFs::new(driver, rt.handle().clone(), tail_cfg);
 
         let mut options = vec![MountOption::FSName("clickfs".to_string()), MountOption::RO];
         // These options are Linux-only (libfuse / fusermount). macFUSE rejects them

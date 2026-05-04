@@ -42,25 +42,19 @@ pub struct ClickFs {
     /// each StreamAll handle's `TailContext`.
     tail_cfg: TailConfig,
 
-    // --- TTL caches ---
-    // Empty key () for the global "list databases" call; tuple keys
-    // for table/partition listings; (db, opt-table, opt-partition)
-    // for existence probes.
+    // --- TTL caches (2s) ---
+    // Empty key () for "list databases"; db name for table lists;
+    // (db, tbl) for partition lists. Coalesces the storm of follow-up
+    // lookups inside a single `ls` (one query, then in-memory contains
+    // checks for each child).
     db_cache: Arc<TtlCache<(), Vec<String>>>,
     table_cache: Arc<TtlCache<String, Vec<String>>>,
     part_cache: Arc<TtlCache<(String, String), Vec<String>>>,
-    #[allow(clippy::type_complexity)]
-    exists_cache: Arc<TtlCache<(String, Option<String>, Option<String>), bool>>,
 }
 
 impl ClickFs {
-    pub fn new(driver: HttpDriver, rt: Handle, cache_ttl_ms: u64, tail_cfg: TailConfig) -> Self {
-        let ttl = Duration::from_millis(cache_ttl_ms);
-        if ttl.is_zero() {
-            tracing::info!(target: "clickfs::cache", "metadata cache disabled");
-        } else {
-            tracing::info!(target: "clickfs::cache", ttl_ms = cache_ttl_ms, "metadata cache enabled");
-        }
+    pub fn new(driver: HttpDriver, rt: Handle, tail_cfg: TailConfig) -> Self {
+        let ttl = Duration::from_millis(2000);
         if !tail_cfg.enabled {
             tracing::info!(target: "clickfs::tail", "tail-mode disabled (--no-tail)");
         } else {
@@ -70,7 +64,7 @@ impl ClickFs {
                 "tail-mode enabled (large reverse pread → ORDER BY <pk> DESC LIMIT N)"
             );
         }
-        let fs = Self {
+        Self {
             driver,
             rt,
             inodes: Arc::new(InodeTable::new()),
@@ -83,73 +77,7 @@ impl ClickFs {
             db_cache: Arc::new(TtlCache::new(ttl)),
             table_cache: Arc::new(TtlCache::new(ttl)),
             part_cache: Arc::new(TtlCache::new(ttl)),
-            exists_cache: Arc::new(TtlCache::new(ttl)),
-        };
-        // Warm metadata caches in the background so the very first
-        // `ls /mnt/db` doesn't pay the round-trip cost. No-op when
-        // caching is disabled (TTL=0) since each insert would expire
-        // before the user can observe it.
-        if !ttl.is_zero() {
-            fs.spawn_prefetch();
         }
-        fs
-    }
-
-    /// Background warm-up of `db_cache` and the first level of
-    /// `table_cache`. Best-effort: any error is logged at debug and
-    /// ignored — the synchronous fetch path will retry on demand.
-    fn spawn_prefetch(&self) {
-        let driver = self.driver.clone();
-        let db_cache = self.db_cache.clone();
-        let table_cache = self.table_cache.clone();
-        self.rt.spawn(async move {
-            let body = match driver.query_text(&driver::sql_list_databases()).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::debug!(target: "clickfs::prefetch", error = %e, "list databases failed");
-                    return;
-                }
-            };
-            let dbs: Vec<String> = body
-                .lines()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            tracing::info!(target: "clickfs::prefetch", count = dbs.len(), "warmed db cache");
-            db_cache.insert((), dbs.clone());
-
-            // Warm tables for each db concurrently. We bound parallelism
-            // to a sane number — even a few hundred dbs is rare, but
-            // we don't want to flood ClickHouse with hundreds of
-            // simultaneous SHOW TABLES queries on huge installs.
-            use futures::stream::{FuturesUnordered, StreamExt};
-            let mut tasks = FuturesUnordered::new();
-            for db in dbs {
-                let driver = driver.clone();
-                tasks.push(async move {
-                    let sql = driver::sql_list_tables(&db);
-                    let body = driver.query_text(&sql).await.ok()?;
-                    let tbls: Vec<String> = body
-                        .lines()
-                        .map(|s| s.to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    Some((db, tbls))
-                });
-                // Keep at most 8 in-flight.
-                if tasks.len() >= 8 {
-                    if let Some(Some((db, tbls))) = tasks.next().await {
-                        table_cache.insert(db, tbls);
-                    }
-                }
-            }
-            while let Some(item) = tasks.next().await {
-                if let Some((db, tbls)) = item {
-                    table_cache.insert(db, tbls);
-                }
-            }
-            tracing::info!(target: "clickfs::prefetch", "warmed table caches");
-        });
     }
 
     fn dir_attr(&self, ino: u64) -> FileAttr {
@@ -320,63 +248,40 @@ impl ClickFs {
         "tuple()".to_string()
     }
 
-    /// Cheap COUNT()-based existence probe. Returns Ok(()) only when the
-    /// referenced object actually exists in ClickHouse; otherwise NotFound.
+    /// Verify the plan corresponds to a real ClickHouse object by
+    /// checking the parent's listing (which is itself cached). Returns
+    /// NotFound for bogus db/table/partition names. Cheap: at most one
+    /// list query per (parent, TTL window), reused across all children.
     fn verify_plan_exists(&self, plan: &resolver::QueryPlan) -> Result<()> {
         use resolver::PlanKind;
-        // Build cache key matching the SQL we'd send. Roots are always
-        // present and skip the cache + the query.
-        let cache_key: Option<(String, Option<String>, Option<String>)> =
-            match (&plan.kind, plan.db.as_deref(), plan.table.as_deref()) {
-                (PlanKind::Root, _, _) | (PlanKind::DbNamespace, _, _) => return Ok(()),
-                (PlanKind::ListTables, Some(db), _) => Some((db.to_string(), None, None)),
-                (PlanKind::ListPartitions, Some(db), Some(t))
-                | (PlanKind::DescribeTable, Some(db), Some(t))
-                | (PlanKind::Readme, Some(db), Some(t))
-                | (PlanKind::HeadNdjson, Some(db), Some(t))
-                | (PlanKind::StreamAll, Some(db), Some(t)) => {
-                    Some((db.to_string(), Some(t.to_string()), None))
-                }
-                (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
-                    Some((db.to_string(), Some(t.to_string()), Some(part.to_string())))
-                }
-                _ => return Err(ClickFsError::NotFound),
-            };
-
-        if let Some(key) = &cache_key {
-            if let Some(exists) = self.exists_cache.get(key) {
-                return if exists {
+        match (&plan.kind, plan.db.as_deref(), plan.table.as_deref()) {
+            (PlanKind::Root, _, _) | (PlanKind::DbNamespace, _, _) => Ok(()),
+            (PlanKind::ListTables, Some(db), _) => {
+                if self.fetch_databases()?.iter().any(|d| d == db) {
                     Ok(())
                 } else {
                     Err(ClickFsError::NotFound)
-                };
+                }
             }
-        }
-
-        let driver = self.driver.clone();
-        let sql = match (&plan.kind, plan.db.as_deref(), plan.table.as_deref()) {
-            (PlanKind::ListTables, Some(db), _) => driver::sql_exists_database(db),
             (PlanKind::ListPartitions, Some(db), Some(t))
             | (PlanKind::DescribeTable, Some(db), Some(t))
             | (PlanKind::Readme, Some(db), Some(t))
             | (PlanKind::HeadNdjson, Some(db), Some(t))
-            | (PlanKind::StreamAll, Some(db), Some(t)) => driver::sql_exists_table(db, t),
-            (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
-                driver::sql_exists_partition(db, t, part)
+            | (PlanKind::StreamAll, Some(db), Some(t)) => {
+                if self.fetch_tables(db)?.iter().any(|x| x == t) {
+                    Ok(())
+                } else {
+                    Err(ClickFsError::NotFound)
+                }
             }
-            _ => unreachable!("filtered above"),
-        };
-        let body = self
-            .block_on(async move { driver.query_text(&sql).await.map_err(ClickFsError::Query) })?;
-        let n: u64 = body.trim().parse().unwrap_or(0);
-        let exists = n != 0;
-        if let Some(key) = cache_key {
-            self.exists_cache.insert(key, exists);
-        }
-        if !exists {
-            Err(ClickFsError::NotFound)
-        } else {
-            Ok(())
+            (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
+                if self.fetch_partitions(db, t)?.iter().any(|p| p == part) {
+                    Ok(())
+                } else {
+                    Err(ClickFsError::NotFound)
+                }
+            }
+            _ => Err(ClickFsError::NotFound),
         }
     }
 }
@@ -830,9 +735,8 @@ mod tests {
     use url::Url;
 
     fn unreachable_driver() -> HttpDriver {
-        // Port 1 is reserved & nothing listens — any prefetch query
-        // will fail fast with a connection refused, which is exactly
-        // the "best-effort, swallow errors" path we want to exercise.
+        // Port 1 is reserved & nothing listens — any query will fail
+        // fast with connection refused.
         HttpDriver::new(
             Url::parse("http://127.0.0.1:1/").unwrap(),
             "u".into(),
@@ -846,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn new_with_ttl_zero_does_not_panic_and_skips_prefetch() {
+    fn new_does_not_panic() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -854,29 +758,8 @@ mod tests {
         let fs = ClickFs::new(
             unreachable_driver(),
             rt.handle().clone(),
-            0,
             TailConfig::default(),
         );
-        assert!(fs.db_cache.get(&()).is_none());
-    }
-
-    #[test]
-    fn new_with_ttl_nonzero_spawns_prefetch_and_survives_failure() {
-        // Prefetch fires against 127.0.0.1:1 and fails. Must not panic
-        // or block ClickFs::new.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let fs = ClickFs::new(
-            unreachable_driver(),
-            rt.handle().clone(),
-            2000,
-            TailConfig::default(),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        // Cache stays empty because the query errored out.
         assert!(fs.db_cache.get(&()).is_none());
     }
 }

@@ -390,30 +390,6 @@ pub fn sql_stream_partition(db: &str, tbl: &str, partition: &str) -> String {
     )
 }
 
-pub fn sql_exists_database(db: &str) -> String {
-    format!(
-        "SELECT count() FROM system.databases WHERE name = {} FORMAT TabSeparated",
-        quote_string(db)
-    )
-}
-
-pub fn sql_exists_table(db: &str, tbl: &str) -> String {
-    format!(
-        "SELECT count() FROM system.tables WHERE database = {} AND name = {} FORMAT TabSeparated",
-        quote_string(db),
-        quote_string(tbl)
-    )
-}
-
-pub fn sql_exists_partition(db: &str, tbl: &str, partition: &str) -> String {
-    format!(
-        "SELECT count() FROM system.parts WHERE database = {} AND table = {} AND active AND partition_id = {} FORMAT TabSeparated",
-        quote_string(db),
-        quote_string(tbl),
-        quote_string(partition)
-    )
-}
-
 /// First N rows in newline-delimited JSON. Used for both `head.ndjson`
 /// (streamed directly) and the README "Sample" section (5 rows).
 pub fn sql_head_ndjson(db: &str, tbl: &str, limit: u32) -> String {

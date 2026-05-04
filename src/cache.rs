@@ -1,30 +1,12 @@
 //! Tiny TTL cache for ClickHouse metadata listings.
 //!
-//! Used by `ClickFs` to avoid re-issuing the same SHOW DATABASES /
-//! SHOW TABLES / system.parts queries on every `ls` and `stat`. The
-//! kernel itself caches FUSE entries, but only per-inode for the TTL
-//! we hand back; tools that rebuild the dentry cache (`find`, `du`,
-//! shells with autocomplete) hammer readdir() and benefit a lot from
-//! coalescing a hundred lookups into one query.
+//! Used by `ClickFs` to coalesce the SHOW DATABASES / SHOW TABLES /
+//! system.parts queries that a single `ls` would otherwise fire once
+//! per child entry. Lookups inside `lookup()` reuse the parent's list
+//! to decide ENOENT, so the cache also doubles as the existence index.
 //!
-//! Design points:
-//!
-//! * Generic `K` and `V`; the FS layer instantiates three caches —
-//!   one for `Vec<String>` (db/table/partition lists keyed by tuple
-//!   of strings) and one for the existence-probe boolean.
-//! * Per-entry TTL stored alongside the value, so a cache with TTL=0
-//!   short-circuits and behaves as a no-op (every `get` returns None,
-//!   `insert` is a no-op).
-//! * Backed by `DashMap` for lock-free concurrent access; suitable
-//!   for the heavy parallel `ls` traffic that `find -j` produces.
-//! * No background eviction thread — entries are checked lazily on
-//!   read. This keeps the cache footprint bounded by traffic, not by
-//!   wall-clock time, which is fine for the tens-to-hundreds of
-//!   databases/tables a typical cluster has.
-//!
-//! Not used to cache `.schema` text or data streams; both are
-//! intentionally always-fresh so an `ALTER TABLE` is visible
-//! immediately to a re-cat.
+//! Backed by `DashMap` for lock-free concurrent access. Entries are
+//! lazily evicted on read; no background reaper.
 
 use std::hash::Hash;
 use std::time::{Duration, Instant};
@@ -46,7 +28,6 @@ where
     V: Clone,
 {
     /// Create a new cache with the given TTL.
-    /// A `ttl` of `Duration::ZERO` makes the cache a no-op (always-miss).
     pub fn new(ttl: Duration) -> Self {
         Self {
             map: DashMap::new(),
@@ -54,17 +35,8 @@ where
         }
     }
 
-    /// `true` iff this cache will actually store anything.
-    pub fn enabled(&self) -> bool {
-        !self.ttl.is_zero()
-    }
-
-    /// Look up a key. Returns `None` on miss, on expiry, or when the
-    /// cache is disabled.
+    /// Look up a key. Returns `None` on miss or on expiry.
     pub fn get(&self, key: &K) -> Option<V> {
-        if !self.enabled() {
-            return None;
-        }
         let entry = self.map.get(key)?;
         let (val, inserted_at) = entry.value();
         if inserted_at.elapsed() <= self.ttl {
@@ -78,37 +50,15 @@ where
         }
     }
 
-    /// Insert (or refresh) a key. No-op when disabled.
+    /// Insert (or refresh) a key.
     pub fn insert(&self, key: K, val: V) {
-        if !self.enabled() {
-            return;
-        }
         self.map.insert(key, (val, Instant::now()));
-    }
-
-    /// Remove a single entry (used when we observe a stale lookup).
-    #[allow(dead_code)]
-    pub fn invalidate(&self, key: &K) {
-        self.map.remove(key);
-    }
-
-    /// Drop everything. Useful for tests; not currently called from
-    /// the FS, but cheap enough to keep around for future
-    /// "reload-on-SIGHUP" behavior.
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.map.clear();
     }
 
     /// Approximate entry count (for diagnostics / tests).
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 
@@ -139,15 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn disabled_is_noop() {
-        let c = TtlCache::<String, u32>::new(Duration::ZERO);
-        assert!(!c.enabled());
-        c.insert("k".into(), 7);
-        assert_eq!(c.get(&"k".into()), None);
-        assert_eq!(c.len(), 0);
-    }
-
-    #[test]
     fn refresh_resets_timer() {
         // Use generous timing so loaded CI runners don't blow the
         // budget between insert/sleep/get. Logic under test is a
@@ -162,24 +103,6 @@ mod tests {
         // reset), but specifically we want to assert the value is
         // the refreshed one and that nothing has expired.
         assert_eq!(c.get(&"k".into()), Some(2));
-    }
-
-    #[test]
-    fn invalidate_drops_entry() {
-        let c = TtlCache::<String, u32>::new(Duration::from_secs(60));
-        c.insert("k".into(), 7);
-        c.invalidate(&"k".into());
-        assert_eq!(c.get(&"k".into()), None);
-    }
-
-    #[test]
-    fn clear_empties_map() {
-        let c = TtlCache::<String, u32>::new(Duration::from_secs(60));
-        c.insert("a".into(), 1);
-        c.insert("b".into(), 2);
-        assert_eq!(c.len(), 2);
-        c.clear();
-        assert!(c.is_empty());
     }
 
     #[test]
