@@ -15,16 +15,19 @@ set -eu
 REPO="donge/clickfs"
 DEFAULT_BIN_DIR="${HOME}/.local/bin"
 
-# colors (no-op if stderr is not a tty)
+# colors (no-op if stderr is not a tty). Stored as real ESC bytes so
+# both `printf '%s'` and heredocs render them correctly.
 if [ -t 2 ]; then
-  GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; DIM='\033[0;90m'; RESET='\033[0m'
+  ESC=$(printf '\033')
+  GREEN="${ESC}[0;32m"; YELLOW="${ESC}[0;33m"; RED="${ESC}[0;31m"
+  DIM="${ESC}[0;90m";   RESET="${ESC}[0m"
 else
   GREEN=''; YELLOW=''; RED=''; DIM=''; RESET=''
 fi
 
-say()  { printf '%bclickfs%b %s\n' "$GREEN"  "$RESET" "$*" >&2; }
-warn() { printf '%bclickfs%b %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-die()  { printf '%bclickfs error:%b %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+say()  { printf '%sclickfs%s %s\n' "$GREEN"  "$RESET" "$*" >&2; }
+warn() { printf '%sclickfs%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die()  { printf '%sclickfs error:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF' >&2
