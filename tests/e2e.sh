@@ -423,6 +423,42 @@ expect_zero   "T35a early close triggers kill query (best-effort)" \
                 exit 1
               "
 
+# T36: README.md pseudo-file is present in the table dir, opens
+# successfully, and has the expected sections.
+expect_zero   "T36 README.md is listed in table dir" \
+              bash -c "ls '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/' | grep -qx 'README.md'"
+expect_zero   "T36a README.md has Stats section" \
+              bash -c "grep -q '^## Stats' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
+expect_zero   "T36b README.md has Schema section" \
+              bash -c "grep -q '^## Schema' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
+expect_zero   "T36c README.md has Columns section" \
+              bash -c "grep -q '^## Columns' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
+expect_zero   "T36d README.md has Sample section" \
+              bash -c "grep -q '^## Sample' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
+expect_zero   "T36e README.md has Files section" \
+              bash -c "grep -q '^## Files' '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/README.md'"
+
+# T37: head.ndjson pseudo-file streams JSONEachRow, one object per
+# line, bounded by LIMIT (so it terminates even on huge tables).
+expect_zero   "T37 head.ndjson is listed in table dir" \
+              bash -c "ls '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/' | grep -qx 'head.ndjson'"
+expect_zero   "T37a head.ndjson is valid JSON-per-line and bounded" \
+              bash -c "
+                # Read the file (LIMIT 100 inside) and check every
+                # non-empty line parses as JSON.
+                cat '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/head.ndjson' | \
+                  awk 'NF{print}' | \
+                  while IFS= read -r line; do
+                    printf '%s\n' \"\$line\" | python3 -c 'import sys,json; json.loads(sys.stdin.read())' \
+                      || exit 1
+                  done
+              "
+expect_zero   "T37b head.ndjson terminates (LIMIT 100 enforced)" \
+              bash -c "
+                COUNT=\$(cat '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/head.ndjson' | awk 'NF' | wc -l | tr -d ' ')
+                test \"\$COUNT\" -le 100 -a \"\$COUNT\" -gt 0
+              "
+
 # T27: --cache-ttl-ms flag exists and accepts 0.
 expect_zero   "T27 --cache-ttl-ms is recognized" \
               bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--cache-ttl-ms'"

@@ -8,11 +8,18 @@ use crate::error::{ClickFsError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanKind {
-    Root,                    // "/"
-    DbNamespace,             // "/db"
-    ListTables,              // "/db/<db>"
-    ListPartitions,          // "/db/<db>/<tbl>"  (dir; readdir merges parts + dotfiles + all.tsv)
-    DescribeTable,           // "/db/<db>/<tbl>/.schema"
+    Root,           // "/"
+    DbNamespace,    // "/db"
+    ListTables,     // "/db/<db>"
+    ListPartitions, // "/db/<db>/<tbl>"  (dir; readdir merges parts + dotfiles + all.tsv)
+    DescribeTable,  // "/db/<db>/<tbl>/.schema"
+    /// "/db/<db>/<tbl>/README.md" — AI-friendly markdown summary
+    /// (schema + stats + sample + example queries). Synthesized by
+    /// concurrently issuing 5 sub-queries; rendered in-memory.
+    Readme,
+    /// "/db/<db>/<tbl>/head.ndjson" — first N rows in JSONEachRow.
+    /// Streamed (no full materialization) but bounded by LIMIT.
+    HeadNdjson,
     StreamAll,               // "/db/<db>/<tbl>/all.tsv"
     StreamPartition(String), // "/db/<db>/<tbl>/<partition>.tsv"
 }
@@ -36,14 +43,14 @@ impl QueryPlan {
     }
 
     pub fn is_special_file(&self) -> bool {
-        matches!(self.kind, PlanKind::DescribeTable)
+        matches!(self.kind, PlanKind::DescribeTable | PlanKind::Readme)
     }
 
     #[allow(dead_code)]
     pub fn is_stream_file(&self) -> bool {
         matches!(
             self.kind,
-            PlanKind::StreamAll | PlanKind::StreamPartition(_)
+            PlanKind::StreamAll | PlanKind::StreamPartition(_) | PlanKind::HeadNdjson
         )
     }
 }
@@ -126,6 +133,16 @@ pub fn resolve(path: &Path) -> Result<QueryPlan> {
                     db: Some(db),
                     table: Some(tbl),
                 }),
+                "README.md" => Ok(QueryPlan {
+                    kind: PlanKind::Readme,
+                    db: Some(db),
+                    table: Some(tbl),
+                }),
+                "head.ndjson" => Ok(QueryPlan {
+                    kind: PlanKind::HeadNdjson,
+                    db: Some(db),
+                    table: Some(tbl),
+                }),
                 "all.tsv" => Ok(QueryPlan {
                     kind: PlanKind::StreamAll,
                     db: Some(db),
@@ -197,5 +214,19 @@ mod tests {
     #[test]
     fn reject_bad_id() {
         assert!(r("/db/foo;bar").is_err());
+    }
+
+    #[test]
+    fn readme_md() {
+        let p = r("/db/default/users/README.md").unwrap();
+        assert!(matches!(p.kind, PlanKind::Readme));
+        assert_eq!(p.db.as_deref(), Some("default"));
+        assert_eq!(p.table.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn head_ndjson() {
+        let p = r("/db/default/users/head.ndjson").unwrap();
+        assert!(matches!(p.kind, PlanKind::HeadNdjson));
     }
 }

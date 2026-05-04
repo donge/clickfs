@@ -209,6 +209,7 @@ dependencies = [
  "libc",
  "once_cell",
  "reqwest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

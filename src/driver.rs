@@ -394,6 +394,52 @@ pub fn sql_exists_partition(db: &str, tbl: &str, partition: &str) -> String {
     )
 }
 
+/// First N rows in newline-delimited JSON. Used for both `head.ndjson`
+/// (streamed directly) and the README "Sample" section (5 rows).
+pub fn sql_head_ndjson(db: &str, tbl: &str, limit: u32) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {} FORMAT JSONEachRow",
+        quote_ident(db),
+        quote_ident(tbl),
+        limit
+    )
+}
+
+/// Aggregate stats from system.parts (active parts only). Returns a
+/// single row TSVRaw: rows, bytes_on_disk, parts, partitions, min_time?, max_time?.
+/// `min_time`/`max_time` are NULL on tables without a partition-level
+/// time column — the README rendering must tolerate that.
+pub fn sql_stats(db: &str, tbl: &str) -> String {
+    format!(
+        "SELECT \
+            sum(rows) AS rows, \
+            sum(bytes_on_disk) AS bytes_on_disk, \
+            count() AS parts, \
+            uniqExact(partition) AS partitions, \
+            min(min_time) AS min_time, \
+            max(max_time) AS max_time \
+         FROM system.parts \
+         WHERE database = {} AND table = {} AND active \
+         FORMAT JSONEachRow",
+        quote_string(db),
+        quote_string(tbl)
+    )
+}
+
+/// Column metadata: name + type + comment. JSONEachRow so the README
+/// renderer can deserialize without fighting TSV escaping.
+pub fn sql_columns(db: &str, tbl: &str) -> String {
+    format!(
+        "SELECT name, type, comment \
+         FROM system.columns \
+         WHERE database = {} AND table = {} \
+         ORDER BY position \
+         FORMAT JSONEachRow",
+        quote_string(db),
+        quote_string(tbl)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

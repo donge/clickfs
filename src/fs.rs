@@ -283,6 +283,8 @@ impl ClickFs {
                 (PlanKind::ListTables, Some(db), _) => Some((db.to_string(), None, None)),
                 (PlanKind::ListPartitions, Some(db), Some(t))
                 | (PlanKind::DescribeTable, Some(db), Some(t))
+                | (PlanKind::Readme, Some(db), Some(t))
+                | (PlanKind::HeadNdjson, Some(db), Some(t))
                 | (PlanKind::StreamAll, Some(db), Some(t)) => {
                     Some((db.to_string(), Some(t.to_string()), None))
                 }
@@ -307,6 +309,8 @@ impl ClickFs {
             (PlanKind::ListTables, Some(db), _) => driver::sql_exists_database(db),
             (PlanKind::ListPartitions, Some(db), Some(t))
             | (PlanKind::DescribeTable, Some(db), Some(t))
+            | (PlanKind::Readme, Some(db), Some(t))
+            | (PlanKind::HeadNdjson, Some(db), Some(t))
             | (PlanKind::StreamAll, Some(db), Some(t)) => driver::sql_exists_table(db, t),
             (PlanKind::StreamPartition(part), Some(db), Some(t)) => {
                 driver::sql_exists_partition(db, t, part)
@@ -436,8 +440,11 @@ impl Filesystem for ClickFs {
                 PlanKind::ListPartitions => {
                     let db = plan.db.as_deref().unwrap();
                     let tbl = plan.table.as_deref().unwrap();
-                    // Always-present meta + all.tsv.
+                    // Always-present meta + AI files + all.tsv. Order
+                    // matters only for human aesthetics — kernel sorts.
                     entries.push((FileType::RegularFile, ".schema".to_string()));
+                    entries.push((FileType::RegularFile, "README.md".to_string()));
+                    entries.push((FileType::RegularFile, "head.ndjson".to_string()));
                     entries.push((FileType::RegularFile, "all.tsv".to_string()));
                     // Partitions (may be empty for non-partitioned tables).
                     match self.fetch_partitions(db, tbl) {
@@ -516,6 +523,30 @@ impl Filesystem for ClickFs {
                         return;
                     }
                 }
+            }
+            PlanKind::Readme => {
+                let db = plan.db.as_deref().unwrap().to_string();
+                let tbl = plan.table.as_deref().unwrap().to_string();
+                let driver = self.driver.clone();
+                // Render synchronously on the runtime. README is small
+                // (a few KB) and we want a deterministic file size at
+                // open() time so cat / cursor / glob behave normally.
+                // The 5 sub-queries inside render() run concurrently.
+                let text = self
+                    .rt
+                    .block_on(async move { crate::readme::render(&driver, &db, &tbl).await });
+                FileHandle::Special {
+                    bytes: Arc::new(text.into_bytes()),
+                }
+            }
+            PlanKind::HeadNdjson => {
+                let db = plan.db.as_deref().unwrap();
+                let tbl = plan.table.as_deref().unwrap();
+                // 100 rows is plenty for `cat | jq` reconnaissance and
+                // small enough that we don't need streaming back-pressure.
+                let sql = driver::sql_head_ndjson(db, tbl, 100);
+                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql);
+                FileHandle::Stream(Arc::new(s))
             }
             PlanKind::StreamAll => {
                 let db = plan.db.as_deref().unwrap();
