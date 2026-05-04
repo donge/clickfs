@@ -101,10 +101,12 @@ mod cli {
             #[arg(long, default_value_t = false)]
             no_tail: bool,
 
-            /// Maximum rows materialized for a single tail-mode read.
-            /// `tail -n N` requests above this cap silently get the cap.
-            /// 10000 is plenty for human use, cheap on the server, and
-            /// fits comfortably in memory at typical row sizes.
+            /// Hard cap on tail-buffer rows (per open file handle).
+            /// The buffer expands on demand through 10 → 100 → 1000 →
+            /// up to this cap, so `tail file` only pays for 10 rows
+            /// while `tail -n 10000` walks the full ladder. Values are
+            /// clamped to 1..=10000: an AI agent reading the buffer
+            /// should never see more than ~10 MB at typical row sizes.
             #[arg(long, env = "CLICKFS_TAIL_ROWS", default_value_t = 10_000)]
             tail_rows: u32,
         },
@@ -212,7 +214,7 @@ mod cli {
         };
         let tail_cfg = TailConfig {
             enabled: !no_tail,
-            rows: tail_rows.max(1),
+            rows: tail_rows.clamp(1, 10_000),
         };
 
         let rt = match Runtime::new() {

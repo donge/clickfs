@@ -24,6 +24,14 @@ pub const PSEUDO_EOF: u64 = u64::MAX / 2;
 /// Reverse-pread distance that flips us into "this is tail" mode.
 const TAIL_TRIGGER_GAP: u64 = 32 * 1024 * 1024;
 
+/// Row counts the tail buffer climbs through on demand. Each step
+/// re-runs `SELECT * ORDER BY <pk> DESC LIMIT N` with the next size,
+/// replacing the previous buffer. A user reading `tail file` only ever
+/// pays for the first 10 rows; `tail -n 100` triggers an extra step;
+/// `tail -n 10000` walks the full ladder. Capped at 10000 to keep
+/// AI agents reading the buffer from drowning in megabytes.
+const TAIL_LADDER: &[u32] = &[10, 100, 1_000, 10_000];
+
 /// Per-table info needed to materialize a tail buffer on demand.
 #[derive(Clone)]
 pub struct TailContext {
@@ -69,10 +77,15 @@ struct Inner {
     /// (row-reversed) tail here and serve subsequent reads from it.
     /// The buffer is conceptually pinned to `[PSEUDO_EOF - len, PSEUDO_EOF)`.
     tail_buf: Option<Bytes>,
-    /// Set true once we've attempted (success or failure) to materialize
-    /// the tail buffer. Prevents re-issuing the SQL on every reverse
-    /// pread when the table is e.g. unreachable.
-    tail_attempted: bool,
+    /// Index into `TAIL_LADDER` of the row count currently materialized
+    /// (only meaningful when `tail_buf` is `Some`). On a pread that
+    /// falls below the buffer start we advance to the next step and
+    /// re-materialize, until we hit the configured cap.
+    tail_step: usize,
+    /// Set true once tail-mode materialization has been ruled out
+    /// (e.g. the SELECT errored, or we've exhausted the ladder up to
+    /// the cap). Prevents pointless retries on every subsequent pread.
+    tail_exhausted: bool,
 }
 
 impl StreamHandle {
@@ -141,7 +154,8 @@ impl StreamHandle {
                 upstream_done: false,
                 last_err: None,
                 tail_buf: None,
-                tail_attempted: false,
+                tail_step: 0,
+                tail_exhausted: false,
             })),
             cancel,
             reverse_warned: AtomicBool::new(false),
@@ -159,45 +173,52 @@ impl StreamHandle {
     /// stream position. A large reverse pread (offset > pos +
     /// `TAIL_TRIGGER_GAP`) when a `TailContext` is set triggers a
     /// one-shot materialization of `SELECT * ORDER BY <pk> DESC LIMIT N`
-    /// and serves subsequent reads from that buffer.
+    /// and serves subsequent reads from that buffer. The buffer starts
+    /// at the smallest ladder step (10 rows) and grows on demand
+    /// whenever a subsequent pread asks for an offset below the
+    /// current buffer start, up to the configured cap.
     pub fn read_blocking(
         &self,
         rt: &tokio::runtime::Handle,
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>, ClickFsError> {
-        // Fast path: serve from an already-materialized tail buffer
-        // whenever the offset falls inside it. Held under the lock to
-        // keep tail_buf access consistent.
         let inner = self.inner.clone();
 
-        // Step 1: maybe materialize the tail buffer. Done outside the
-        // lock so the (potentially slow) HTTP call doesn't block other
-        // reads. The flag `tail_attempted` (set under the lock) prevents
-        // re-entry.
-        let need_materialize = {
+        // Step 1: decide whether to (re-)materialize the tail buffer.
+        // Two cases trigger materialization:
+        //   (a) first reverse pread, no buffer yet, gap > TRIGGER
+        //   (b) buffer exists but offset is below its origin -> grow.
+        // Done outside the lock so the HTTP call doesn't block other
+        // reads. `tail_exhausted` short-circuits both cases.
+        let next_rows: Option<u32> = {
             let g = rt.block_on(async { inner.lock().await });
-            offset != g.pos
-                && !g.tail_attempted
-                && g.tail_buf.is_none()
-                && self.tail.is_some()
-                && offset > g.pos.saturating_add(TAIL_TRIGGER_GAP)
+            self.choose_next_tail_rows(&g, offset)
         };
-        if need_materialize {
+        if let Some(rows) = next_rows {
             let tail = self.tail.as_ref().unwrap().clone();
             let driver = self.driver.clone();
-            let mat = rt.block_on(async move { materialize_tail(&driver, &tail).await });
+            let mat = rt.block_on(async move { materialize_tail(&driver, &tail, rows).await });
             let mut g = rt.block_on(async { inner.lock().await });
-            g.tail_attempted = true;
             match mat {
                 Ok(buf) => {
                     tracing::info!(
                         target: "clickfs::stream",
                         query_id = %self.query_id,
                         bytes = buf.len(),
+                        rows = rows,
                         "tail buffer materialized"
                     );
                     g.tail_buf = Some(buf);
+                    // Record which ladder step we just landed on so a
+                    // future grow knows where to climb from.
+                    g.tail_step = TAIL_LADDER
+                        .iter()
+                        .position(|&n| n >= rows)
+                        .unwrap_or(TAIL_LADDER.len() - 1);
+                    if rows >= self.tail_cap() {
+                        g.tail_exhausted = true;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -206,6 +227,7 @@ impl StreamHandle {
                         error = %e,
                         "tail buffer materialization failed; falling back to EIO"
                     );
+                    g.tail_exhausted = true;
                 }
             }
         }
@@ -296,6 +318,56 @@ impl StreamHandle {
         self.cancel.notify_waiters();
     }
 
+    /// Hard cap on tail-buffer rows, taken from the per-table
+    /// `TailContext` configuration.
+    fn tail_cap(&self) -> u32 {
+        self.tail.as_ref().map(|t| t.cfg.rows).unwrap_or(0)
+    }
+
+    /// Decide which ladder size to materialize next, given the current
+    /// state and the requested offset. Returns `None` when no
+    /// (re-)materialization is needed.
+    fn choose_next_tail_rows(&self, g: &Inner, offset: u64) -> Option<u32> {
+        if self.tail.is_none() || g.tail_exhausted || !self.tail.as_ref().unwrap().cfg.enabled {
+            return None;
+        }
+        let cap = self.tail_cap();
+        if cap == 0 {
+            return None;
+        }
+        match &g.tail_buf {
+            None => {
+                // First-time trigger: only fire on a meaningfully large
+                // reverse pread, to avoid spending a SELECT on a small
+                // forward skip.
+                if offset != g.pos && offset > g.pos.saturating_add(TAIL_TRIGGER_GAP) {
+                    Some(std::cmp::min(TAIL_LADDER[0], cap))
+                } else {
+                    None
+                }
+            }
+            Some(buf) => {
+                let buf_origin = PSEUDO_EOF.saturating_sub(buf.len() as u64);
+                // Reader wants something below the buffer start while
+                // still inside the pseudo-EOF window: grow.
+                if offset >= buf_origin || offset >= PSEUDO_EOF {
+                    return None;
+                }
+                let next_step = g.tail_step + 1;
+                if next_step >= TAIL_LADDER.len() {
+                    return None;
+                }
+                let next_rows = std::cmp::min(TAIL_LADDER[next_step], cap);
+                let cur_rows = TAIL_LADDER[g.tail_step].min(cap);
+                if next_rows <= cur_rows {
+                    None
+                } else {
+                    Some(next_rows)
+                }
+            }
+        }
+    }
+
     /// The server-side query_id assigned to this stream. Exposed mainly
     /// for tests and for operators wanting to correlate with
     /// system.query_log.
@@ -308,8 +380,12 @@ impl StreamHandle {
 /// One-shot fetch of `SELECT * ORDER BY <pk> DESC LIMIT N` followed by
 /// an in-memory row-reversal so the buffer reads "oldest first". The
 /// header line is preserved at offset 0.
-async fn materialize_tail(driver: &HttpDriver, tail: &TailContext) -> Result<Bytes, QueryError> {
-    let sql = crate::driver::sql_select_tail(&tail.db, &tail.tbl, &tail.order_expr, tail.cfg.rows);
+async fn materialize_tail(
+    driver: &HttpDriver,
+    tail: &TailContext,
+    rows: u32,
+) -> Result<Bytes, QueryError> {
+    let sql = crate::driver::sql_select_tail(&tail.db, &tail.tbl, &tail.order_expr, rows);
     let body = driver.query_text(&sql).await?;
     Ok(reverse_tsv_rows(&body))
 }
@@ -513,7 +589,7 @@ mod tests {
         rt.block_on(async {
             let mut g = h.inner.lock().await;
             g.tail_buf = Some(tail_bytes);
-            g.tail_attempted = true;
+            g.tail_exhausted = true;
         });
         let buf_origin = PSEUDO_EOF - tail_len;
         // Read whole buffer.
@@ -543,5 +619,104 @@ mod tests {
             .read_blocking(rt.handle(), PSEUDO_EOF - 100, 4096)
             .unwrap_err();
         assert!(matches!(err, ClickFsError::ReadOrder { .. }));
+    }
+
+    /// Build a StreamHandle with a TailContext attached, used to test
+    /// the ladder logic without network.
+    fn fake_handle_with_tail(rt: &tokio::runtime::Runtime, cap: u32) -> StreamHandle {
+        let driver = HttpDriver::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            "x".into(),
+            String::new(),
+            60,
+            0,
+            crate::driver::TlsConfig::default(),
+            crate::driver::CompressionConfig::default(),
+        )
+        .unwrap();
+        let tail = TailContext {
+            db: "d".into(),
+            tbl: "t".into(),
+            order_expr: "tuple()".into(),
+            cfg: TailConfig {
+                enabled: true,
+                rows: cap,
+            },
+        };
+        let h = StreamHandle::spawn(rt.handle(), driver, "SELECT 1".into(), Some(tail));
+        h.cancel();
+        h
+    }
+
+    #[test]
+    fn ladder_first_step_is_smallest_within_cap() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle_with_tail(&rt, 10_000);
+        rt.block_on(async {
+            let g = h.inner.lock().await;
+            // Big reverse pread, no buffer yet -> ladder[0] = 10.
+            let n = h.choose_next_tail_rows(&g, PSEUDO_EOF - 1024);
+            assert_eq!(n, Some(10));
+            // Tiny forward skip -> nothing.
+            let n2 = h.choose_next_tail_rows(&g, 4096);
+            assert_eq!(n2, None);
+        });
+    }
+
+    #[test]
+    fn ladder_grows_when_offset_below_buffer_origin() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle_with_tail(&rt, 10_000);
+        rt.block_on(async {
+            let mut g = h.inner.lock().await;
+            // Pretend ladder[0]=10 buffer is already installed (100 bytes).
+            g.tail_buf = Some(Bytes::from_static(&[b'x'; 100]));
+            g.tail_step = 0;
+            let buf_origin = PSEUDO_EOF - 100;
+            // Inside buffer -> nothing.
+            assert_eq!(h.choose_next_tail_rows(&g, buf_origin + 50), None);
+            // Below buffer origin -> climb to ladder[1] = 100.
+            assert_eq!(h.choose_next_tail_rows(&g, buf_origin - 1), Some(100));
+        });
+    }
+
+    #[test]
+    fn ladder_clamps_to_cap() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // cap=50 forces the very first materialization to use 50,
+        // not ladder[0]=10 — actually the implementation takes min,
+        // so ladder[0]=10 still wins on step 0. Verify cap bites at
+        // step 1.
+        let h = fake_handle_with_tail(&rt, 50);
+        rt.block_on(async {
+            let mut g = h.inner.lock().await;
+            g.tail_buf = Some(Bytes::from_static(&[b'x'; 100]));
+            g.tail_step = 0; // current = ladder[0] = 10
+                             // Below origin -> next would be 100, clamped to cap=50.
+            assert_eq!(h.choose_next_tail_rows(&g, PSEUDO_EOF - 200), Some(50));
+        });
+    }
+
+    #[test]
+    fn ladder_exhausted_returns_none() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle_with_tail(&rt, 10_000);
+        rt.block_on(async {
+            let mut g = h.inner.lock().await;
+            g.tail_exhausted = true;
+            assert_eq!(h.choose_next_tail_rows(&g, PSEUDO_EOF - 1024), None);
+        });
     }
 }
