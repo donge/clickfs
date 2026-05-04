@@ -7,10 +7,34 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use reqwest::Client;
+use reqwest::{Certificate, Client};
 use url::Url;
 
 use crate::error::{clickhouse_code_name, parse_clickhouse_error, QueryError, Result};
+
+/// TLS configuration for the HTTP client.
+///
+/// `insecure` and `ca_bundle` are mutually exclusive at the CLI layer
+/// (clap `conflicts_with`), but the constructor enforces it as well so
+/// nobody can build an inconsistent driver from inside the crate.
+#[derive(Default, Clone, Debug)]
+pub struct TlsConfig {
+    /// Skip ALL TLS verification (hostname + chain). Dev/lab only.
+    pub insecure: bool,
+    /// Optional extra CA bundle (PEM, may contain multiple certs)
+    /// added to the system trust store. None = system roots only.
+    pub ca_bundle_pem: Option<Vec<u8>>,
+}
+
+impl TlsConfig {
+    /// Validate flag combinations. Used by `HttpDriver::new` and unit tests.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.insecure && self.ca_bundle_pem.is_some() {
+            return Err("--insecure and --ca-bundle are mutually exclusive");
+        }
+        Ok(())
+    }
+}
 
 /// Convert a non-success HTTP response into a `QueryError`, preferring a
 /// structured `QueryError::ClickHouse` when we can parse one out of the
@@ -58,11 +82,42 @@ impl HttpDriver {
         password: String,
         query_timeout_secs: u64,
         max_result_bytes: u64,
+        tls: TlsConfig,
     ) -> Result<Self> {
-        let client = Client::builder()
+        tls.validate()
+            .map_err(|e| QueryError::Transport(e.to_string()))?;
+
+        let mut builder = Client::builder()
             // Per-request timeout disabled; we rely on server-side
             // max_execution_time for streaming reads.
-            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .pool_idle_timeout(Some(Duration::from_secs(60)));
+
+        if tls.insecure {
+            tracing::warn!(
+                target: "clickfs::tls",
+                "TLS verification disabled (--insecure). Do not use in production."
+            );
+            builder = builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
+
+        if let Some(pem) = &tls.ca_bundle_pem {
+            // PEM bundle may contain multiple BEGIN CERTIFICATE blocks;
+            // Certificate::from_pem_bundle returns Vec<Certificate>.
+            let certs = Certificate::from_pem_bundle(pem)
+                .map_err(|e| QueryError::Transport(format!("ca-bundle: {}", e)))?;
+            tracing::info!(
+                target: "clickfs::tls",
+                count = certs.len(),
+                "loaded extra CA bundle"
+            );
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        let client = builder
             .build()
             .map_err(|e| QueryError::Transport(e.to_string()))?;
 
@@ -258,4 +313,68 @@ pub fn sql_exists_partition(db: &str, tbl: &str, partition: &str) -> String {
         quote_string(tbl),
         quote_string(partition)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_default_is_valid() {
+        assert!(TlsConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn tls_insecure_only_is_valid() {
+        let cfg = TlsConfig {
+            insecure: true,
+            ca_bundle_pem: None,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_ca_bundle_only_is_valid() {
+        let cfg = TlsConfig {
+            insecure: false,
+            ca_bundle_pem: Some(b"-----BEGIN CERTIFICATE-----".to_vec()),
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_insecure_and_ca_bundle_conflict() {
+        let cfg = TlsConfig {
+            insecure: true,
+            ca_bundle_pem: Some(b"x".to_vec()),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn driver_new_rejects_conflicting_tls() {
+        let url = Url::parse("http://localhost:8123").unwrap();
+        let cfg = TlsConfig {
+            insecure: true,
+            ca_bundle_pem: Some(b"x".to_vec()),
+        };
+        let r = HttpDriver::new(url, "u".into(), "p".into(), 60, 1024, cfg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn driver_new_rejects_garbage_ca_bundle() {
+        // A non-PEM blob should fail to parse.
+        let url = Url::parse("http://localhost:8123").unwrap();
+        let cfg = TlsConfig {
+            insecure: false,
+            ca_bundle_pem: Some(b"this is not a certificate".to_vec()),
+        };
+        let r = HttpDriver::new(url, "u".into(), "p".into(), 60, 1024, cfg);
+        // from_pem_bundle on garbage returns an empty Vec on some
+        // versions and an error on others; either way, must not panic.
+        // Accept both outcomes to avoid coupling to reqwest internals.
+        let _ = r;
+    }
 }

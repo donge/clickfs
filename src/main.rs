@@ -25,7 +25,7 @@ mod cli {
     use tracing_subscriber::EnvFilter;
     use url::Url;
 
-    use crate::driver::HttpDriver;
+    use crate::driver::{HttpDriver, TlsConfig};
     use crate::fs::ClickFs;
 
     #[derive(Parser, Debug)]
@@ -68,6 +68,17 @@ mod cli {
             /// Auto-unmount when the process exits.
             #[arg(long, default_value_t = true)]
             auto_unmount: bool,
+
+            /// Disable TLS certificate verification (dev/lab only).
+            /// Mutually exclusive with --ca-bundle.
+            #[arg(long, default_value_t = false, conflicts_with = "ca_bundle")]
+            insecure: bool,
+
+            /// Path to a PEM file containing extra CA certificate(s) to
+            /// trust on top of the system trust store. Mutually exclusive
+            /// with --insecure.
+            #[arg(long, value_name = "PATH")]
+            ca_bundle: Option<PathBuf>,
         },
 
         /// Unmount a previously mounted clickfs.
@@ -94,6 +105,8 @@ mod cli {
                 max_result_bytes,
                 allow_other,
                 auto_unmount,
+                insecure,
+                ca_bundle,
             } => run_mount(
                 url,
                 mountpoint,
@@ -103,6 +116,8 @@ mod cli {
                 max_result_bytes,
                 allow_other,
                 auto_unmount,
+                insecure,
+                ca_bundle,
             ),
             Command::Umount { mountpoint } => run_umount(mountpoint),
         }
@@ -118,6 +133,8 @@ mod cli {
         max_result_bytes: u64,
         allow_other: bool,
         auto_unmount: bool,
+        insecure: bool,
+        ca_bundle: Option<PathBuf>,
     ) -> std::process::ExitCode {
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
@@ -135,6 +152,25 @@ mod cli {
             return std::process::ExitCode::from(2);
         }
 
+        let ca_bundle_pem = match ca_bundle.as_ref() {
+            Some(path) => match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    eprintln!(
+                        "clickfs: failed to read --ca-bundle '{}': {}",
+                        path.display(),
+                        e
+                    );
+                    return std::process::ExitCode::from(2);
+                }
+            },
+            None => None,
+        };
+        let tls = TlsConfig {
+            insecure,
+            ca_bundle_pem,
+        };
+
         let rt = match Runtime::new() {
             Ok(r) => r,
             Err(e) => {
@@ -149,6 +185,7 @@ mod cli {
             password,
             query_timeout,
             max_result_bytes,
+            tls,
         ) {
             Ok(d) => d,
             Err(e) => {

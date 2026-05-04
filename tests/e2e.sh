@@ -364,6 +364,11 @@ sys.exit(0)
 expect_zero   "T31a mount.log mentions reverse seek" \
               bash -c "grep -q 'reverse seek' '$CLICKFS_LOG'"
 
+# T32: TLS option mutual exclusion is enforced by clap.
+# We invoke the binary directly (no mount) and check exit + message.
+expect_zero   "T32 --insecure conflicts with --ca-bundle" \
+              bash -c "'$CLICKFS_BIN' mount http://x /tmp --insecure --ca-bundle /etc/hosts 2>&1 | grep -q 'cannot be used with'"
+
 # --------------------------------------------------------------------------
 # Phase 6: read-only enforcement (EROFS).
 # --------------------------------------------------------------------------

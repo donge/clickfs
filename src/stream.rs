@@ -187,6 +187,7 @@ mod tests {
             String::new(),
             60,
             0,
+            crate::driver::TlsConfig::default(),
         )
         .unwrap();
         let h = StreamHandle::spawn(rt.handle(), driver, "SELECT 1".into());
