@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-04
+
+### Removed
+
+- **Reverted the v0.4.0 elastic tail-buffer ladder.** The
+  `[10, 100, 1000, 10000]` on-demand ladder turned out to be a
+  net regression in practice. It assumed reverse-pread clients
+  would request small ranges first; in reality:
+  - **Linux GNU tail** (coreutils 9.4) `fstat`s the file, sees
+    `st_size = 2^63`, then `lseek(SEEK_END)` followed by a single
+    `read(8192)` of the last 8 KiB. The first ladder rung
+    materializes only ~125 bytes (10 rows of a typical narrow
+    table) and pins the buffer to `[EOF-125, EOF)`, so the
+    `[EOF-8192, EOF-1)` read falls *outside* the buffer and
+    returns `EIO`. Result: `tail file` produced **zero output**
+    on Linux under v0.4.0.
+  - **macOS BSD tail** never reverse-preads on a `2^63`-sized
+    regular file at all (it bails out and falls back to a
+    forward scan), so the ladder is dead code on Darwin.
+  v0.3.2's "single `SELECT ... ORDER BY <pk> DESC LIMIT N`" is
+  restored. With the default `N = 10000`, the buffer is large
+  enough (typically > 8 KiB) to satisfy GNU tail's first read,
+  and `tail file` works as expected on Linux. macOS BSD tail
+  remains unable to use the buffer (a platform limitation, not
+  a clickfs bug). Net: **-185 LOC** versus v0.4.0, no behavior
+  change versus v0.3.2.
+
+### Notes
+
+- v0.4.0 should be considered withdrawn. The GitHub release tag
+  remains for archival but the binaries are not recommended.
+
 ## [0.3.2] - 2026-05-04
 
 ### Removed

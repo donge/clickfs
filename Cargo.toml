@@ -1,6 +1,6 @@
 [package]
 name = "clickfs"
-version = "0.3.2"
+version = "0.4.1"
 edition = "2021"
 description = "Mount ClickHouse as a read-only POSIX filesystem"
 license = "MIT OR Apache-2.0"
