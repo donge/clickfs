@@ -31,11 +31,7 @@ struct Inner {
 
 impl StreamHandle {
     /// Spawn a streaming task. Caller passes the runtime handle so we can spawn.
-    pub fn spawn(
-        rt: &tokio::runtime::Handle,
-        driver: HttpDriver,
-        sql: String,
-    ) -> Self {
+    pub fn spawn(rt: &tokio::runtime::Handle, driver: HttpDriver, sql: String) -> Self {
         let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, QueryError>>(8);
         let cancel = Arc::new(Notify::new());
         let cancel_task = cancel.clone();

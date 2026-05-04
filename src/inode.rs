@@ -71,10 +71,7 @@ impl InodeTable {
     }
 
     fn hash(&self, path: &Path) -> u64 {
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let mut h = self.hasher.build_hasher();
-        path.hash(&mut h);
-        let v = h.finish();
+        let v = self.hasher.hash_one(path);
         // Make sure we never return 0 or 1 (1 is root).
         v | 0x2
     }

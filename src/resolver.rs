@@ -8,13 +8,13 @@ use crate::error::{ClickFsError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanKind {
-    Root,                      // "/"
-    DbNamespace,               // "/db"
-    ListTables,                // "/db/<db>"
-    ListPartitions,            // "/db/<db>/<tbl>"  (dir; readdir merges parts + dotfiles + all.tsv)
-    DescribeTable,             // "/db/<db>/<tbl>/.schema"
-    StreamAll,                 // "/db/<db>/<tbl>/all.tsv"
-    StreamPartition(String),   // "/db/<db>/<tbl>/<partition>.tsv"
+    Root,                    // "/"
+    DbNamespace,             // "/db"
+    ListTables,              // "/db/<db>"
+    ListPartitions,          // "/db/<db>/<tbl>"  (dir; readdir merges parts + dotfiles + all.tsv)
+    DescribeTable,           // "/db/<db>/<tbl>/.schema"
+    StreamAll,               // "/db/<db>/<tbl>/all.tsv"
+    StreamPartition(String), // "/db/<db>/<tbl>/<partition>.tsv"
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,10 @@ impl QueryPlan {
     pub fn is_dir(&self) -> bool {
         matches!(
             self.kind,
-            PlanKind::Root | PlanKind::DbNamespace | PlanKind::ListTables | PlanKind::ListPartitions
+            PlanKind::Root
+                | PlanKind::DbNamespace
+                | PlanKind::ListTables
+                | PlanKind::ListPartitions
         )
     }
 
@@ -38,7 +41,10 @@ impl QueryPlan {
 
     #[allow(dead_code)]
     pub fn is_stream_file(&self) -> bool {
-        matches!(self.kind, PlanKind::StreamAll | PlanKind::StreamPartition(_))
+        matches!(
+            self.kind,
+            PlanKind::StreamAll | PlanKind::StreamPartition(_)
+        )
     }
 }
 
@@ -48,16 +54,15 @@ fn valid_identifier(s: &str) -> bool {
         && s.len() <= 192
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        // identifiers proper (db/table) must not start with '.', but partition_ids may.
-        // We allow '.' here and let the caller filter dotfiles separately.
+    // identifiers proper (db/table) must not start with '.', but partition_ids may.
+    // We allow '.' here and let the caller filter dotfiles separately.
 }
 
 fn valid_db_or_table(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 192
         && !s.starts_with('.')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub fn resolve(path: &Path) -> Result<QueryPlan> {

@@ -192,7 +192,8 @@ pub fn sql_stream_all(db: &str, tbl: &str) -> String {
     )
 }
 
-pub fn sql_stream_partition(db: &str, tbl: &str, partition: &str) -> String {    format!(
+pub fn sql_stream_partition(db: &str, tbl: &str, partition: &str) -> String {
+    format!(
         "SELECT * FROM {}.{} WHERE _partition_id = {} FORMAT TabSeparatedWithNames",
         quote_ident(db),
         quote_ident(tbl),

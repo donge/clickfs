@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test-linux:
+    name: build + test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libfuse
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libfuse-dev fuse
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (release)
+        run: cargo build --release --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo clippy
+        run: cargo clippy --release --locked -- -D warnings
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickfs-linux-x86_64
+          path: target/release/clickfs
+          if-no-files-found: error
+          retention-days: 14
+
+  test-macos:
+    name: build + test (macOS, no FUSE)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # macFUSE requires a kext approval that needs a real reboot, so on
+      # GitHub-hosted macOS runners we can only build and test the
+      # FUSE-independent modules. The fs.rs / main.rs FUSE wiring is
+      # validated by the Linux job above.
+      - name: cargo check (no fuse feature)
+        run: cargo check --no-default-features --locked
+
+      - name: cargo test (no fuse feature)
+        run: cargo test --no-default-features --locked

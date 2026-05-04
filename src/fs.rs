@@ -77,7 +77,7 @@ impl ClickFs {
         FileAttr {
             ino,
             size,
-            blocks: (size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64,
+            blocks: size.div_ceil(BLOCK_SIZE as u64),
             atime: self.start_time,
             mtime: self.start_time,
             ctime: self.start_time,
@@ -125,7 +125,11 @@ impl ClickFs {
                 .query_text(&driver::sql_list_databases())
                 .await
                 .map_err(ClickFsError::Query)?;
-            Ok(body.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect())
+            Ok(body
+                .lines()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
         })
     }
 
@@ -133,11 +137,12 @@ impl ClickFs {
         let driver = self.driver.clone();
         let sql = driver::sql_list_tables(db);
         self.block_on(async move {
-            let body = driver
-                .query_text(&sql)
-                .await
-                .map_err(ClickFsError::Query)?;
-            Ok(body.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect())
+            let body = driver.query_text(&sql).await.map_err(ClickFsError::Query)?;
+            Ok(body
+                .lines()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
         })
     }
 
@@ -145,10 +150,7 @@ impl ClickFs {
         let driver = self.driver.clone();
         let sql = driver::sql_list_partitions(db, tbl);
         self.block_on(async move {
-            let body = driver
-                .query_text(&sql)
-                .await
-                .map_err(ClickFsError::Query)?;
+            let body = driver.query_text(&sql).await.map_err(ClickFsError::Query)?;
             Ok(body
                 .lines()
                 .map(|s| s.to_string())
@@ -164,12 +166,7 @@ impl ClickFs {
     fn fetch_describe(&self, db: &str, tbl: &str) -> Result<String> {
         let driver = self.driver.clone();
         let sql = driver::sql_describe(db, tbl);
-        self.block_on(async move {
-            driver
-                .query_text(&sql)
-                .await
-                .map_err(ClickFsError::Query)
-        })
+        self.block_on(async move { driver.query_text(&sql).await.map_err(ClickFsError::Query) })
     }
 
     /// Cheap COUNT()-based existence probe. Returns Ok(()) only when the
@@ -190,12 +187,8 @@ impl ClickFs {
             // Defensive: any plan that lacks the expected db/table is bogus.
             _ => return Err(ClickFsError::NotFound),
         };
-        let body = self.block_on(async move {
-            driver
-                .query_text(&sql)
-                .await
-                .map_err(ClickFsError::Query)
-        })?;
+        let body = self
+            .block_on(async move { driver.query_text(&sql).await.map_err(ClickFsError::Query) })?;
         let n: u64 = body.trim().parse().unwrap_or(0);
         if n == 0 {
             Err(ClickFsError::NotFound)
@@ -481,11 +474,10 @@ impl Filesystem for ClickFs {
         reply: ReplyEmpty,
     ) {
         let mut map = self.handles.lock().unwrap();
-        if let Some(h) = map.remove(&fh) {
-            if let FileHandle::Stream(s) = &h {
-                s.cancel();
-            }
-            // Dropping `h` shuts everything down.
+        // Removing drops the handle (and any Arc<StreamHandle> inside);
+        // for streams we also notify the producer task to stop early.
+        if let Some(FileHandle::Stream(s)) = map.remove(&fh) {
+            s.cancel();
         }
         reply.ok();
     }
@@ -595,14 +587,14 @@ impl Filesystem for ClickFs {
         const PSEUDO_FILES: u64 = 1u64 << 32; // ~4 billion; safe for i64 display
         let used_files = self.handles.lock().unwrap().len() as u64 + 1024;
         reply.statfs(
-            PSEUDO_BLOCKS,                                    // blocks
-            PSEUDO_BLOCKS,                                    // bfree
-            PSEUDO_BLOCKS,                                    // bavail
-            PSEUDO_FILES,                                     // files (total)
-            PSEUDO_FILES.saturating_sub(used_files),          // ffree
-            BLOCK_SIZE,                                       // bsize
-            255,                                              // namelen
-            BLOCK_SIZE,                                       // frsize
+            PSEUDO_BLOCKS,                           // blocks
+            PSEUDO_BLOCKS,                           // bfree
+            PSEUDO_BLOCKS,                           // bavail
+            PSEUDO_FILES,                            // files (total)
+            PSEUDO_FILES.saturating_sub(used_files), // ffree
+            BLOCK_SIZE,                              // bsize
+            255,                                     // namelen
+            BLOCK_SIZE,                              // frsize
         );
     }
 }

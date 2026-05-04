@@ -2,6 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/clickfs.svg)](https://crates.io/crates/clickfs)
 [![docs](https://img.shields.io/badge/docs-donge.github.io%2Fclickfs-FFCC01)](https://donge.github.io/clickfs)
+[![CI](https://github.com/donge/clickfs/actions/workflows/ci.yml/badge.svg)](https://github.com/donge/clickfs/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/clickfs.svg)](#license)
 
 Mount a ClickHouse server as a read-only POSIX filesystem. Browse databases
