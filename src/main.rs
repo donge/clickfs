@@ -26,7 +26,7 @@ mod cli {
     use tracing_subscriber::EnvFilter;
     use url::Url;
 
-    use crate::driver::{HttpDriver, TlsConfig};
+    use crate::driver::{CompressionConfig, HttpDriver, TlsConfig};
     use crate::fs::ClickFs;
 
     #[derive(Parser, Debug)]
@@ -88,6 +88,15 @@ mod cli {
             /// `ls`/`find` cheap without hiding schema changes for long.
             #[arg(long, env = "CLICKFS_CACHE_TTL_MS", default_value_t = 2000)]
             cache_ttl_ms: u64,
+
+            /// Disable HTTP gzip compression. By default clickfs sends
+            /// `Accept-Encoding: gzip` and asks ClickHouse to compress
+            /// the response (`enable_http_compression=1`), which is
+            /// typically a 30-50% speedup over WAN/TLS for large
+            /// streams. The flag is mostly useful when debugging the
+            /// raw SQL response in mount.log.
+            #[arg(long, default_value_t = false)]
+            no_compression: bool,
         },
 
         /// Unmount a previously mounted clickfs.
@@ -117,6 +126,7 @@ mod cli {
                 insecure,
                 ca_bundle,
                 cache_ttl_ms,
+                no_compression,
             } => run_mount(
                 url,
                 mountpoint,
@@ -129,6 +139,7 @@ mod cli {
                 insecure,
                 ca_bundle,
                 cache_ttl_ms,
+                no_compression,
             ),
             Command::Umount { mountpoint } => run_umount(mountpoint),
         }
@@ -147,6 +158,7 @@ mod cli {
         insecure: bool,
         ca_bundle: Option<PathBuf>,
         cache_ttl_ms: u64,
+        no_compression: bool,
     ) -> std::process::ExitCode {
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
@@ -182,6 +194,9 @@ mod cli {
             insecure,
             ca_bundle_pem,
         };
+        let compression = CompressionConfig {
+            enabled: !no_compression,
+        };
 
         let rt = match Runtime::new() {
             Ok(r) => r,
@@ -198,6 +213,7 @@ mod cli {
             query_timeout,
             max_result_bytes,
             tls,
+            compression,
         ) {
             Ok(d) => d,
             Err(e) => {

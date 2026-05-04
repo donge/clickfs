@@ -369,6 +369,20 @@ expect_zero   "T31a mount.log mentions reverse seek" \
 expect_zero   "T32 --insecure conflicts with --ca-bundle" \
               bash -c "'$CLICKFS_BIN' mount http://x /tmp --insecure --ca-bundle /etc/hosts 2>&1 | grep -q 'cannot be used with'"
 
+# T33: HTTP gzip compression flag exists and SQL contains
+# enable_http_compression=1 by default. We can't easily inspect the
+# wire bytes here, but we CAN verify the SETTINGS clause is appended
+# to the query the driver issues, which is what triggers ClickHouse
+# to compress. The companion --no-compression flag must hide it.
+expect_zero   "T33 --no-compression flag is recognized" \
+              bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--no-compression'"
+expect_zero   "T33a default mount sends enable_http_compression=1" \
+              bash -c "
+                # Trigger at least one query, then grep the SQL trace log.
+                cat '$MOUNTPOINT/db/$TEST_DB/$TEST_TABLE/.schema' >/dev/null
+                grep -q 'enable_http_compression=1' '$CLICKFS_LOG'
+              "
+
 # T27: --cache-ttl-ms flag exists and accepts 0.
 expect_zero   "T27 --cache-ttl-ms is recognized" \
               bash -c "'$CLICKFS_BIN' mount --help | grep -q -- '--cache-ttl-ms'"

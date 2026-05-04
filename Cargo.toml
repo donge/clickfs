@@ -43,7 +43,7 @@ fuse = ["dep:fuser"]
 [dependencies]
 fuser = { version = "0.14", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip"] }
 bytes = "1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }

@@ -36,6 +36,23 @@ impl TlsConfig {
     }
 }
 
+/// Compression configuration for the HTTP client.
+///
+/// When `enabled` (the default) reqwest sends `Accept-Encoding: gzip`
+/// and transparently decodes the response, AND we tell ClickHouse to
+/// `enable_http_compression=1` so it actually compresses. Either side
+/// missing is a no-op, so disabling is safe but pointless.
+#[derive(Clone, Debug)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Convert a non-success HTTP response into a `QueryError`, preferring a
 /// structured `QueryError::ClickHouse` when we can parse one out of the
 /// `X-ClickHouse-Exception-Code` header or the body.
@@ -73,6 +90,7 @@ pub struct HttpDriver {
     client: Client,
     query_timeout_secs: u64,
     max_result_bytes: u64,
+    compression: CompressionConfig,
 }
 
 impl HttpDriver {
@@ -83,6 +101,7 @@ impl HttpDriver {
         query_timeout_secs: u64,
         max_result_bytes: u64,
         tls: TlsConfig,
+        compression: CompressionConfig,
     ) -> Result<Self> {
         tls.validate()
             .map_err(|e| QueryError::Transport(e.to_string()))?;
@@ -90,7 +109,12 @@ impl HttpDriver {
         let mut builder = Client::builder()
             // Per-request timeout disabled; we rely on server-side
             // max_execution_time for streaming reads.
-            .pool_idle_timeout(Some(Duration::from_secs(60)));
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            // gzip(true) makes reqwest send Accept-Encoding: gzip and
+            // transparently decode the response. We pair this with
+            // enable_http_compression=1 in append_settings so ClickHouse
+            // actually compresses.
+            .gzip(compression.enabled);
 
         if tls.insecure {
             tracing::warn!(
@@ -128,19 +152,25 @@ impl HttpDriver {
             client,
             query_timeout_secs,
             max_result_bytes,
+            compression,
         })
     }
 
     fn append_settings(&self, sql: &str, streaming: bool) -> String {
+        let compression_setting = if self.compression.enabled {
+            ", enable_http_compression=1"
+        } else {
+            ""
+        };
         if streaming {
             format!(
-                "{} SETTINGS max_execution_time={}, max_result_bytes={}, readonly=2",
-                sql, self.query_timeout_secs, self.max_result_bytes
+                "{} SETTINGS max_execution_time={}, max_result_bytes={}, readonly=2{}",
+                sql, self.query_timeout_secs, self.max_result_bytes, compression_setting
             )
         } else {
             format!(
-                "{} SETTINGS max_execution_time={}, readonly=2",
-                sql, self.query_timeout_secs
+                "{} SETTINGS max_execution_time={}, readonly=2{}",
+                sql, self.query_timeout_secs, compression_setting
             )
         }
     }
@@ -359,7 +389,15 @@ mod tests {
             insecure: true,
             ca_bundle_pem: Some(b"x".to_vec()),
         };
-        let r = HttpDriver::new(url, "u".into(), "p".into(), 60, 1024, cfg);
+        let r = HttpDriver::new(
+            url,
+            "u".into(),
+            "p".into(),
+            60,
+            1024,
+            cfg,
+            CompressionConfig::default(),
+        );
         assert!(r.is_err());
     }
 
@@ -371,10 +409,63 @@ mod tests {
             insecure: false,
             ca_bundle_pem: Some(b"this is not a certificate".to_vec()),
         };
-        let r = HttpDriver::new(url, "u".into(), "p".into(), 60, 1024, cfg);
+        let r = HttpDriver::new(
+            url,
+            "u".into(),
+            "p".into(),
+            60,
+            1024,
+            cfg,
+            CompressionConfig::default(),
+        );
         // from_pem_bundle on garbage returns an empty Vec on some
         // versions and an error on others; either way, must not panic.
         // Accept both outcomes to avoid coupling to reqwest internals.
         let _ = r;
+    }
+
+    #[test]
+    fn compression_default_is_enabled() {
+        assert!(CompressionConfig::default().enabled);
+    }
+
+    #[test]
+    fn compression_setting_in_sql_when_enabled() {
+        let url = Url::parse("http://localhost:8123").unwrap();
+        let d = HttpDriver::new(
+            url,
+            "u".into(),
+            "p".into(),
+            60,
+            1024,
+            TlsConfig::default(),
+            CompressionConfig { enabled: true },
+        )
+        .unwrap();
+        let sql = d.append_settings("SELECT 1", false);
+        assert!(
+            sql.contains("enable_http_compression=1"),
+            "expected enable_http_compression=1 in SQL, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn compression_setting_absent_when_disabled() {
+        let url = Url::parse("http://localhost:8123").unwrap();
+        let d = HttpDriver::new(
+            url,
+            "u".into(),
+            "p".into(),
+            60,
+            1024,
+            TlsConfig::default(),
+            CompressionConfig { enabled: false },
+        )
+        .unwrap();
+        let sql = d.append_settings("SELECT 1", true);
+        assert!(
+            !sql.contains("enable_http_compression"),
+            "expected NO enable_http_compression in SQL, got: {sql}"
+        );
     }
 }
