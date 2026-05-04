@@ -32,6 +32,11 @@ pub struct TailContext {
     /// Comma-separated column list, or the literal `tuple()` for tables
     /// without a primary/sorting key.
     pub order_expr: String,
+    /// When `Some`, the materialization SELECT is restricted to a single
+    /// partition via `WHERE _partition_id = '<id>'`. Used so `tail
+    /// 20260503.tsv` works on partition pseudo-files (without this
+    /// the partition file's reverse pread always returned EIO).
+    pub partition: Option<String>,
     pub cfg: TailConfig,
 }
 
@@ -309,7 +314,13 @@ impl StreamHandle {
 /// an in-memory row-reversal so the buffer reads "oldest first". The
 /// header line is preserved at offset 0.
 async fn materialize_tail(driver: &HttpDriver, tail: &TailContext) -> Result<Bytes, QueryError> {
-    let sql = crate::driver::sql_select_tail(&tail.db, &tail.tbl, &tail.order_expr, tail.cfg.rows);
+    let sql = crate::driver::sql_select_tail(
+        &tail.db,
+        &tail.tbl,
+        &tail.order_expr,
+        tail.partition.as_deref(),
+        tail.cfg.rows,
+    );
     let body = driver.query_text(&sql).await?;
     Ok(reverse_tsv_rows(&body))
 }

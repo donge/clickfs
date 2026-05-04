@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-05-04
+
+### Fixed
+
+- **Enable tail-mode for partition pseudo-files.** `tail <partition>.tsv`
+  previously returned `EIO` because only `all.tsv` received a
+  `TailContext`; partition streams were opened as strict forward-only
+  readers. Partition tail now materializes `SELECT * ... WHERE
+  _partition_id = '<id>' ORDER BY <pk> DESC LIMIT N`, then serves the
+  reversed buffer the same way as `all.tsv`.
+
 ## [0.4.1] - 2026-05-04
 
 ### Removed

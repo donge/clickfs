@@ -521,6 +521,7 @@ impl Filesystem for ClickFs {
                         db: db.to_string(),
                         tbl: tbl.to_string(),
                         order_expr,
+                        partition: None,
                         cfg: self.tail_cfg.clone(),
                     };
                     let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, Some(tail));
@@ -534,8 +535,24 @@ impl Filesystem for ClickFs {
                 let db = plan.db.as_deref().unwrap();
                 let tbl = plan.table.as_deref().unwrap();
                 let sql = driver::sql_stream_partition(db, tbl, part);
-                let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
-                FileHandle::Stream(Arc::new(s))
+                if self.tail_cfg.enabled {
+                    // Same path as StreamAll, but with a partition filter
+                    // baked into the tail SELECT so `tail 20260503.tsv`
+                    // works on per-partition pseudo-files.
+                    let order_expr = self.fetch_tail_order_expr(db, tbl);
+                    let tail = TailContext {
+                        db: db.to_string(),
+                        tbl: tbl.to_string(),
+                        order_expr,
+                        partition: Some(part.clone()),
+                        cfg: self.tail_cfg.clone(),
+                    };
+                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, Some(tail));
+                    FileHandle::Stream(Arc::new(s))
+                } else {
+                    let s = StreamHandle::spawn(&self.rt, self.driver.clone(), sql, None);
+                    FileHandle::Stream(Arc::new(s))
+                }
             }
             _ => {
                 reply.error(libc::EISDIR);

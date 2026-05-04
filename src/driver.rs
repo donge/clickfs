@@ -417,9 +417,18 @@ pub fn sql_table_pk(db: &str, tbl: &str) -> String {
 /// `SELECT *` ordered DESC by `order_expr` (already a comma-separated
 /// column list, or the literal `tuple()`), limited to N rows. Used to
 /// materialize the tail buffer when a reader does a large reverse pread.
-/// Output is `TabSeparatedWithNames`; caller is responsible for
-/// reversing the data rows so the buffer reads "oldest first".
-pub fn sql_select_tail(db: &str, tbl: &str, order_expr: &str, limit: u32) -> String {
+/// When `partition` is `Some`, restricts the SELECT to a single partition
+/// via `WHERE _partition_id = '<id>'` so `tail <part>.tsv` works on the
+/// per-partition pseudo-files. Output is `TabSeparatedWithNames`; caller
+/// is responsible for reversing the data rows so the buffer reads
+/// "oldest first".
+pub fn sql_select_tail(
+    db: &str,
+    tbl: &str,
+    order_expr: &str,
+    partition: Option<&str>,
+    limit: u32,
+) -> String {
     // For multi-column keys we must apply DESC to every column, not just
     // the trailing one (`a, b DESC` only sorts b descending). `tuple()`
     // is a single expression so the simple form still works.
@@ -433,10 +442,15 @@ pub fn sql_select_tail(db: &str, tbl: &str, order_expr: &str, limit: u32) -> Str
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let where_clause = match partition {
+        Some(part) => format!(" WHERE _partition_id = {}", quote_string(part)),
+        None => String::new(),
+    };
     format!(
-        "SELECT * FROM {}.{} ORDER BY {} LIMIT {} FORMAT TabSeparatedWithNames",
+        "SELECT * FROM {}.{}{} ORDER BY {} LIMIT {} FORMAT TabSeparatedWithNames",
         quote_ident(db),
         quote_ident(tbl),
+        where_clause,
         order_clause,
         limit
     )
@@ -593,16 +607,17 @@ mod tests {
 
     #[test]
     fn sql_select_tail_quotes_ident_and_orders_desc() {
-        let s = sql_select_tail("my db", "my tbl", "id", 10);
+        let s = sql_select_tail("my db", "my tbl", "id", None, 10);
         assert!(s.contains("`my db`.`my tbl`"));
         assert!(s.contains("ORDER BY id DESC"));
         assert!(s.contains("LIMIT 10"));
+        assert!(!s.contains("WHERE"), "no partition filter expected: {s}");
         assert!(s.ends_with("FORMAT TabSeparatedWithNames"));
     }
 
     #[test]
     fn sql_select_tail_accepts_tuple_fallback() {
-        let s = sql_select_tail("d", "t", "tuple()", 5);
+        let s = sql_select_tail("d", "t", "tuple()", None, 5);
         assert!(s.contains("ORDER BY tuple() DESC"));
     }
 
@@ -610,8 +625,24 @@ mod tests {
     fn sql_select_tail_applies_desc_per_column() {
         // Multi-column key must DESC every column, not just the last,
         // otherwise ClickHouse only sorts the trailing column descending.
-        let s = sql_select_tail("d", "t", "a, b, c", 7);
+        let s = sql_select_tail("d", "t", "a, b, c", None, 7);
         assert!(s.contains("ORDER BY a DESC, b DESC, c DESC"), "got: {s}");
         assert!(s.contains("LIMIT 7"));
+    }
+
+    #[test]
+    fn sql_select_tail_with_partition_adds_where_clause() {
+        // Partition filter must appear *before* ORDER BY and quote the
+        // partition id as a string literal (matches sql_stream_partition).
+        let s = sql_select_tail("d", "t", "ts", Some("20260503"), 10);
+        assert!(
+            s.contains("WHERE _partition_id = '20260503'"),
+            "missing partition filter: {s}"
+        );
+        let where_pos = s.find("WHERE").expect("has WHERE");
+        let order_pos = s.find("ORDER BY").expect("has ORDER BY");
+        assert!(where_pos < order_pos, "WHERE must precede ORDER BY: {s}");
+        assert!(s.contains("ORDER BY ts DESC"));
+        assert!(s.contains("LIMIT 10"));
     }
 }
