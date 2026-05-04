@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-04
+
+### Changed
+
+- Simplified metadata caching: removed the dedicated existence-probe
+  cache and its `SELECT count()` queries; `lookup()` now reuses the
+  parent's listing for ENOENT decisions. Dropped the background
+  prefetch task and the `--cache-ttl-ms` / `CLICKFS_CACHE_TTL_MS`
+  knob (TTL is now hardcoded to 2s). No user-visible behavior change
+  for typical exploration; schema changes still visible within 2s.
+
 ## [0.3.0] - 2026-05-04
 
 ### Added
