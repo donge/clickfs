@@ -2,6 +2,7 @@
 //!
 //! Strict-sequential semantics: read(offset) where offset != stream_pos → EIO.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -16,6 +17,9 @@ use crate::error::{ClickFsError, QueryError};
 pub struct StreamHandle {
     inner: Arc<Mutex<Inner>>,
     cancel: Arc<Notify>,
+    /// Whether we've already warned about a reverse seek on this handle.
+    /// Used to keep the log from filling up if a tool retries repeatedly.
+    reverse_warned: AtomicBool,
     _task: JoinHandle<()>,
 }
 
@@ -79,6 +83,7 @@ impl StreamHandle {
                 last_err: None,
             })),
             cancel,
+            reverse_warned: AtomicBool::new(false),
             _task: task,
         }
     }
@@ -102,6 +107,19 @@ impl StreamHandle {
             }
 
             if offset != g.pos {
+                // A backwards (or skipping) seek breaks streaming semantics.
+                // Warn once per handle so the log isn't flooded by tools that
+                // retry. Common offenders: `tail -n N` (seeks to EOF first),
+                // editors with mmap, anything calling lseek(SEEK_END).
+                if offset < g.pos && !self.reverse_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "clickfs::stream",
+                        cursor = g.pos,
+                        requested_offset = offset,
+                        "reverse seek not supported on streaming files; \
+                         use 'cat ... | tail -n N' or 'head -c N | tail' instead"
+                    );
+                }
                 return Err(ClickFsError::ReadOrder {
                     expected: g.pos,
                     got: offset,
@@ -148,5 +166,79 @@ impl Drop for StreamHandle {
     fn drop(&mut self) {
         self.cancel();
         // Task is detached; it will observe cancellation on next await.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::HttpDriver;
+    use url::Url;
+
+    /// Build a StreamHandle whose upstream returns immediately with a single
+    /// chunk, so we can drive `read_blocking` against it without a real
+    /// ClickHouse server.
+    fn fake_handle(rt: &tokio::runtime::Runtime, body: &'static [u8]) -> StreamHandle {
+        // Spawn a real StreamHandle, but we won't actually let it talk to the
+        // network — we manually craft Inner state below.
+        let driver = HttpDriver::new(
+            Url::parse("http://127.0.0.1:1/").unwrap(),
+            "x".into(),
+            String::new(),
+            60,
+            0,
+        )
+        .unwrap();
+        let h = StreamHandle::spawn(rt.handle(), driver, "SELECT 1".into());
+        // Replace the channel state synchronously: stuff `body` into pending
+        // and mark upstream done so reads don't block on rx.
+        rt.block_on(async {
+            let mut g = h.inner.lock().await;
+            g.pending.extend_from_slice(body);
+            g.upstream_done = true;
+            g.last_err = None;
+        });
+        h.cancel(); // make sure the spawned task quits
+        h
+    }
+
+    #[test]
+    fn reverse_seek_warns_once_and_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle(&rt, b"abcdefghij");
+
+        // Forward read advances cursor.
+        let buf = h.read_blocking(rt.handle(), 0, 5).unwrap();
+        assert_eq!(buf, b"abcde");
+
+        // Reverse seek -> error, warn fires once.
+        let err1 = h.read_blocking(rt.handle(), 0, 5).unwrap_err();
+        assert!(matches!(err1, ClickFsError::ReadOrder { .. }));
+        assert!(h.reverse_warned.load(Ordering::Relaxed));
+
+        // Second reverse seek -> still error, but warn flag already set.
+        let err2 = h.read_blocking(rt.handle(), 0, 5).unwrap_err();
+        assert!(matches!(err2, ClickFsError::ReadOrder { .. }));
+        assert!(h.reverse_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn sequential_reads_do_not_warn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = fake_handle(&rt, b"abcdefghij");
+
+        let a = h.read_blocking(rt.handle(), 0, 4).unwrap();
+        assert_eq!(a, b"abcd");
+        let b = h.read_blocking(rt.handle(), 4, 4).unwrap();
+        assert_eq!(b, b"efgh");
+        let c = h.read_blocking(rt.handle(), 8, 10).unwrap();
+        assert_eq!(c, b"ij");
+        assert!(!h.reverse_warned.load(Ordering::Relaxed));
     }
 }

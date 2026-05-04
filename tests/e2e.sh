@@ -345,6 +345,25 @@ expect_zero   "T15 concurrent reads (3 parallel)" \
                   head -c 1024 $MOUNTPOINT/db/system/databases/all.tsv >/dev/null & \
                   wait )"
 
+# T31: a reverse seek (pread offset < cursor) must fail with EIO AND
+# emit a friendly warning into the mount log. We use python to issue
+# an explicit forward-then-reverse pread on the same fd, since macOS
+# `tail -n N` actually reads forward (kernel/tool quirk) and doesn't
+# trigger a reverse seek.
+expect_nonzero "T31 reverse pread denied" \
+              python3 -c "
+import os, sys
+fd = os.open('$STREAM_FILE', os.O_RDONLY)
+os.read(fd, 1024)         # advance cursor
+try:
+    os.pread(fd, 100, 0)  # reverse seek: offset 0 < cursor
+except OSError as e:
+    sys.exit(1)
+sys.exit(0)
+"
+expect_zero   "T31a mount.log mentions reverse seek" \
+              bash -c "grep -q 'reverse seek' '$CLICKFS_LOG'"
+
 # --------------------------------------------------------------------------
 # Phase 6: read-only enforcement (EROFS).
 # --------------------------------------------------------------------------
