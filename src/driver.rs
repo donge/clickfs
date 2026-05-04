@@ -1,7 +1,7 @@
 //! ClickHouse HTTP driver.
 //!
-//! - `query_text`  : small queries returning a full text body.
-//! - `query_stream`: streaming queries returning a Bytes stream.
+//! - `query_text`           : small queries returning a full text body.
+//! - `query_stream_with_id` : streaming queries returning a Bytes stream.
 
 use std::time::Duration;
 
@@ -226,17 +226,6 @@ impl HttpDriver {
             ));
         }
         Ok(body)
-    }
-
-    /// Streaming query. Returns a stream of Bytes chunks; dropping the stream
-    /// closes the underlying HTTP connection (best-effort cancel).
-    #[allow(dead_code)]
-    pub async fn query_stream(
-        &self,
-        sql: &str,
-    ) -> std::result::Result<impl Stream<Item = std::result::Result<Bytes, QueryError>>, QueryError>
-    {
-        self.query_stream_with_id(sql, None).await
     }
 
     /// Streaming query with an optional caller-supplied query_id, used so
