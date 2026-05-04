@@ -7,8 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-04
+
 ### Added
 
+- **AI-friendly per-table pseudo-files.** Every
+  `/db/<db>/<tbl>/` directory now exposes two new files designed for
+  agents and humans doing reconnaissance without writing SQL:
+  - `README.md` — markdown summary regenerated on each `open()`,
+    synthesized from 5 concurrent sub-queries (DESCRIBE, aggregate
+    stats from `system.parts`, `system.columns`, `COUNT()`, and a
+    5-row sample). Sections: **Stats** (rows / size on disk / parts /
+    partitions / avg bytes-per-row), **Schema** (`SHOW CREATE TABLE`
+    fenced as ```sql```), **Columns** (markdown table), **Sample**
+    (5 rows as `JSONEachRow`), **Example queries**, **Files**.
+    Failed sub-queries degrade to `_(unavailable)_` so a missing
+    `SELECT` privilege on `system.parts` doesn't black-hole the
+    file.
+  - `head.ndjson` — first 100 rows in `JSONEachRow`, streamed.
+    Bounded by `LIMIT 100` so it terminates even on
+    billion-row tables and is safe to pipe to `jq`.
+- **HTTP gzip compression** (default on; `--no-compression` to
+  disable). Sends `Accept-Encoding: gzip` and asks ClickHouse to
+  compress with `enable_http_compression=1`. Typically 30-50%
+  fewer wire bytes on large `all.tsv` streams over WAN/TLS.
+- **Mount-time metadata prefetch.** `ClickFs::new` spawns a
+  background warm-up that populates `db_cache` (one
+  `SHOW DATABASES`) and the first level of `table_cache`
+  (`SHOW TABLES` per database, bounded to 8 in flight). The very
+  first `ls /mnt/db` after mount becomes a cache hit. Skipped
+  when `--cache-ttl-ms=0`.
+- **Server-side query cancellation.** Every streaming query is
+  tagged with a `clickfs-<uuid>` `query_id`; closing the file
+  before EOF now triggers a detached
+  `KILL QUERY WHERE query_id = ... ASYNC`. Connection-drop alone
+  worked but could lag seconds on long-running queries — KILL
+  makes Ctrl-C deterministic. Best-effort: any KILL error is
+  logged at debug and swallowed.
 - **Metadata cache** (`--cache-ttl-ms`, env `CLICKFS_CACHE_TTL_MS`,
   default `2000` ms). Database / table / partition listings and the
   per-lookup existence probe are now cached in-process for the
@@ -45,13 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The `Files` table inside `README.md` is the single discovery
+  surface for agents — it documents `.schema`, `README.md`,
+  `head.ndjson`, `all.tsv`, and `<partition>.tsv` together.
 - Default e2e log level bumped to `clickfs=debug` so the SQL trace
-  needed by the new cache-effectiveness test is captured.
-
-### Fixed
-
-- *(see git log for the v0.1.0 → v0.1.1 release fixes around mount
-  options and pseudo-file sizes that landed earlier.)*
+  needed by the cache-effectiveness and KILL-query tests is captured.
 
 ## [0.1.1] - 2026-05-04
 
@@ -91,6 +124,7 @@ Initial public release.
 - GitHub Actions CI: rustfmt, Linux build/test/clippy `-D warnings`
   with binary artifact, macOS build/test (`--no-default-features`).
 
-[Unreleased]: https://github.com/donge/clickfs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/donge/clickfs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/donge/clickfs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/donge/clickfs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/donge/clickfs/releases/tag/v0.1.0

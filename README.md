@@ -43,13 +43,28 @@ Everything is streamed — no temp files, no buffering of full result sets.
 └── db/
     └── <database>/
         └── <table>/
-            ├── .schema        # SHOW CREATE TABLE output
-            ├── all.tsv        # full table, TSVWithNames
-            └── <part_id>.tsv  # one file per partition_id
+            ├── .schema       # SHOW CREATE TABLE output
+            ├── README.md     # AI/agent-friendly summary (regenerated on open)
+            ├── head.ndjson   # first 100 rows in JSONEachRow
+            ├── all.tsv       # full table, TSVWithNames
+            └── <part_id>.tsv # one file per partition_id
 ```
 
 Partitions are listed dynamically from `system.parts` (active only).
-Both `all.tsv` and per-partition files are streamed lazily on `read()`.
+`all.tsv` and per-partition files are streamed lazily on `read()`.
+
+### AI-friendly pseudo-files
+
+`README.md` is synthesized on each `open()` from 5 concurrent
+sub-queries (`DESCRIBE`, aggregate stats from `system.parts`,
+`system.columns`, `COUNT()`, and a 5-row sample). It contains
+**Stats**, **Schema**, **Columns**, **Sample**, **Example queries**,
+and **Files** — everything an agent needs to understand a table
+without writing SQL. Failed sub-queries degrade to `_(unavailable)_`
+so a missing privilege never black-holes the file.
+
+`head.ndjson` is `LIMIT 100` of `JSONEachRow`, ideal for piping to
+`jq`. It always terminates, even on billion-row tables.
 
 ---
 
@@ -114,6 +129,7 @@ Common options:
 | `--query-timeout`      | `60`             | Server-side query timeout (seconds)  |
 | `--max-result-bytes`   | `1073741824`     | Per-query byte cap (1 GiB)           |
 | `--cache-ttl-ms`       | `2000`           | Metadata cache TTL (or `CLICKFS_CACHE_TTL_MS`); `0` disables |
+| `--no-compression`     | off              | Disable HTTP gzip (default sends `Accept-Encoding: gzip` and `enable_http_compression=1`) |
 | `--insecure`           | off              | Skip TLS cert + hostname verification (dev only) |
 | `--ca-bundle <PATH>`   | *(unset)*        | Extra PEM CA bundle to trust on top of system roots |
 
