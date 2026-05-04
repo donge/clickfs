@@ -7,28 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-05-04
-
-### Changed
-
-- **Tail buffer is now elastic.** Instead of a single fixed-size
-  materialization (previously `LIMIT 10000` regardless of what the
-  reader actually wanted), the tail buffer now climbs an on-demand
-  ladder `10 → 100 → 1000 → 10000`. `tail file` (default `-n 10`)
-  costs exactly one `SELECT LIMIT 10`; `tail -n 100` triggers a
-  second `SELECT LIMIT 100` once the kernel `tail` reads past the
-  first buffer head; `tail -n 10000` walks the full ladder.
-  This eliminates the previous "every reverse pread costs 10000
-  rows" cliff and means small tail reads are ~1000× cheaper on the
-  server.
-
-- **`--tail-rows` is now a hard cap, clamped to `1..=10000`.** The
-  flag retains its name but its semantics are now "ceiling for the
-  ladder" rather than "fixed materialization size". Values above
-  10000 are silently clamped: the cap exists so an AI agent reading
-  `all.tsv` can never get more than ~10 MB of tail buffer, no matter
-  how the operator configured the mount.
-
 ## [0.3.2] - 2026-05-04
 
 ### Removed
